@@ -160,10 +160,10 @@ class StrategyAllocator:
             # Every eligible strategy has non-positive expectancy. Do not try to
             # pick the least bad — hold them all at the floor and let the
             # strategy kill switch handle the genuinely broken ones.
-            out = dict.fromkeys(strategies, 1.0)
+            floored: dict[str, float] = dict.fromkeys(strategies, 1.0)
             for name in eligible:
-                out[name] = cfg.min_weight
-            return out
+                floored[name] = cfg.min_weight
+            return floored
 
         average = eligible_total / len(eligible)
         out: dict[str, float] = {}

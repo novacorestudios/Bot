@@ -18,6 +18,7 @@ import logging
 import logging.handlers
 import re
 import sys
+from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -71,9 +72,16 @@ def _scrub(value: Any, depth: int = 0) -> Any:
     return value
 
 
-def redact_processor(_logger: Any, _name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
-    """structlog processor applying both redaction layers."""
-    return _scrub(event_dict)  # type: ignore[return-value]
+def redact_processor(
+    _logger: Any, _name: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    """structlog processor applying both redaction layers.
+
+    Typed against MutableMapping rather than dict to match structlog's own
+    processor signature — narrowing it to dict type-checks at the call site but
+    not against the framework.
+    """
+    return _scrub(dict(event_dict))  # type: ignore[no-any-return]
 
 
 def configure_logging(

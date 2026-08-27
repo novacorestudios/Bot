@@ -10,9 +10,6 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  PYTHONPATH: src
-
 jobs:
   lint:
     name: Lint & type check
@@ -23,13 +20,15 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: pip install -r requirements-dev.txt
+      - run: pip install -e ".[dev]" || pip install -r requirements-dev.txt
       - name: Ruff
         run: ruff check src tests
       - name: Ruff format check
         run: ruff format --check src tests
+      # A real gate. It was `|| true` while typing debt existed; that debt is
+      # now zero, so a new type error fails the build rather than being hidden.
       - name: Mypy
-        run: mypy src/tradebot || true   # advisory until typing debt is cleared
+        run: mypy src/tradebot
 
   test:
     name: Tests (${{ matrix.suite }})
@@ -44,7 +43,9 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: pip install -r requirements-dev.txt
+      # Editable install, so `pytest` resolves the package the same way a
+      # contributor's checkout does — no PYTHONPATH incantation.
+      - run: pip install -r requirements-dev.txt && pip install -e .
       - name: Run ${{ matrix.suite }} tests
         run: pytest tests/${{ matrix.suite }} -q --cov=src/tradebot --cov-report=xml
       - name: Upload coverage
@@ -69,8 +70,10 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - name: Bandit (static security analysis)
         run: bandit -r src -c pyproject.toml -q
+      # Also a real gate. A newly disclosed vulnerability in a dependency
+      # should stop a deploy, not produce a green build.
       - name: Dependency vulnerability audit
-        run: pip-audit -r requirements.txt --strict || true
+        run: pip-audit -r requirements.txt --strict
       - name: Refuse committed secrets
         run: python scripts/check_secrets.py
 

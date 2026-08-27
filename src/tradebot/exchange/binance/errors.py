@@ -114,7 +114,12 @@ def raise_for_code(code: int, message: str, endpoint: str = "", status: int = 40
             **context,
         )
     if code in RATE_LIMIT:
-        raise RateLimitError(f"rate limited: {message}", retry_after=5.0, **context)
+        # order_context, not context: `context` carries a `code` key and
+        # RateLimitError takes `banned` positionally after retry_after, so
+        # splatting the full mapping risks a silent argument collision.
+        raise RateLimitError(
+            f"rate limited: {message}", retry_after=5.0, banned=False, **order_context
+        )
     if code in MARGIN_ERRORS:
         raise InsufficientMarginError(f"insufficient margin: {message}", code=code, **order_context)
     if code in FILTER_ERRORS:

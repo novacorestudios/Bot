@@ -111,8 +111,8 @@ async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:
     }
 
     # -- out-of-sample split ------------------------------------------------ #
-    if args.split:
-        split_ms = _parse_date(args.split)
+    split_ms = _parse_date(args.split) if args.split else None
+    if split_ms is not None:
         in_sample = [t for t in result.trades if t.closed_at < split_ms]
         out_sample = [t for t in result.trades if t.closed_at >= split_ms]
         in_curve = [p for p in result.equity_curve if p.timestamp < split_ms]

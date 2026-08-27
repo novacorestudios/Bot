@@ -69,7 +69,7 @@ class CooldownManager:
     ) -> float:
         """How long the cooldown should last, in seconds."""
         cfg = self.config
-        base = cfg.after_win_seconds if won else cfg.after_loss_seconds
+        base = float(cfg.after_win_seconds if won else cfg.after_loss_seconds)
 
         if not won:
             streak = self._consecutive.get(self._key(symbol, strategy), 0)

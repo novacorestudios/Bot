@@ -493,8 +493,12 @@ class Repository:
                     if days <= 0:
                         continue
                     cutoff = now_ms - days * 86_400_000
-                    result = await session.execute(delete(model).where(model.timestamp < cutoff))
-                    removed[model.__tablename__] = int(result.rowcount or 0)
+                    # Every prunable model declares a `timestamp` column; the
+                    # shared Base does not, so it is reached through the table
+                    # rather than the class attribute.
+                    column = model.__table__.c.timestamp
+                    result = await session.execute(delete(model).where(column < cutoff))
+                    removed[model.__tablename__] = int(getattr(result, "rowcount", 0) or 0)
                 await session.commit()
         except Exception as exc:  # noqa: BLE001
             log.warning("database_prune_failed", error=str(exc)[:200])

@@ -12,6 +12,12 @@ dynamic = ["dependencies"]
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=4.1",
+    "ruff>=0.3", "mypy>=1.8", "bandit>=1.7", "pip-audit>=2.7", "types-PyYAML",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
@@ -20,6 +26,10 @@ tradebot = "tradebot.app.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Makes `pytest` work from the repository root without PYTHONPATH=src. Without
+# this every contributor has to know the incantation, and CI only worked because
+# it happened to export the variable.
+pythonpath = ["src"]
 asyncio_mode = "auto"
 addopts = "-q --strict-markers"
 markers = [
@@ -42,6 +52,12 @@ ignore = ["E501", "B008", "SIM108", "RET504", "ARG002"]
 
 [tool.mypy]
 python_version = "3.11"
+# Without this plugin mypy does not understand pydantic's field defaults and
+# reports ~139 phantom "missing named argument" errors on every model
+# instantiation, which drowns out the real findings.
+plugins = ["pydantic.mypy"]
+# Typing debt is tracked in mypy-baseline.txt and gated in CI: new errors fail
+# the build, the existing count may only go down.
 packages = ["tradebot"]
 mypy_path = "src"
 ignore_missing_imports = true
