@@ -1,0 +1,354 @@
+# =============================================================================
+# Tunable parameters. Nothing here is a proven-optimal value — every number is a
+# STARTING POINT that must be validated by backtest, walk-forward and paper
+# trading before it is trusted. See IMPLEMENTATION_PLAN.md §9.
+# =============================================================================
+
+account:
+  # Used for BACKTEST/PAPER. In LIVE the real balance from Binance overrides it.
+  initial_capital: 75.0
+  quote_asset: USDT
+
+risk:
+  # Fraction of equity risked per trade (0.005 = 0.5%). NOT proven optimal.
+  risk_per_trade: 0.005
+  # Hard floor/ceiling the sizing routine may never cross.
+  min_risk_per_trade: 0.001
+  max_risk_per_trade: 0.02
+
+  max_concurrent_positions: 4
+  # Sum of open risk (distance-to-stop * qty) as a fraction of equity.
+  max_total_risk: 0.02
+  # Notional exposure caps as a multiple of equity.
+  max_symbol_exposure: 1.0
+  max_direction_exposure: 3.0
+  max_total_exposure: 4.0
+  # Margin used / equity.
+  max_margin_usage: 0.5
+
+  # Leverage. Never used to enlarge risk — only to make a risk-correct position
+  # representable given the account size.
+  max_leverage: 5
+  min_leverage: 1
+  # Leverage is reduced when realised volatility exceeds this (fraction, ATR/price).
+  leverage_volatility_threshold: 0.010
+  # Required distance between entry and estimated liquidation, as a multiple of
+  # the stop distance. A trade whose liquidation sits closer than this is rejected.
+  min_liquidation_distance_multiple: 3.0
+
+  # Correlation control
+  max_pair_correlation: 0.75
+  max_portfolio_correlation: 0.60
+  correlation_lookback_bars: 240
+  correlation_timeframe: 5m
+  # Effective-bets floor: adding a position must not push diversification below this.
+  min_effective_positions_ratio: 0.55
+
+  # Daily / drawdown protection (fractions of equity)
+  max_daily_loss: 0.02
+  max_hourly_loss: 0.01
+  max_drawdown: 0.10
+  max_consecutive_losses: 5
+  # Trading day boundary, UTC hour.
+  day_reset_hour_utc: 0
+
+kill_switches:
+  max_api_errors_per_5min: 20
+  max_rejected_orders_per_hour: 5
+  # Observed slippage (fraction of price) above which entries are halted.
+  max_slippage: 0.0025
+  # Consecutive reconciliation mismatches before entries are halted.
+  max_reconciliation_mismatches: 2
+  # No market data for this long -> safe mode.
+  ws_stale_seconds: 30
+  # Abnormal market: |return| over abnormal_window_bars beyond this -> PANIC.
+  abnormal_return_threshold: 0.05
+  abnormal_window_bars: 5
+  # Automatic re-arm delay after a switch trips, seconds. 0 = manual only.
+  auto_rearm_seconds: 900
+
+cooldown:
+  base_seconds: 120
+  after_loss_seconds: 420
+  after_win_seconds: 90
+  # Multiplier applied per consecutive loss on the same symbol.
+  consecutive_loss_multiplier: 2.0
+  max_seconds: 3600
+  # Cooldown also applies to the strategy that lost, on that symbol.
+  per_strategy: true
+
+scanner:
+  # Full universe re-rank interval (seconds).
+  scan_interval_sec: 300
+  # Fast signal loop over the current candidates (seconds).
+  signal_interval_sec: 15
+  top_markets: 25
+  quote_asset: USDT
+  contract_type: PERPETUAL
+  # Hard filters applied before scoring.
+  min_24h_quote_volume: 20000000.0
+  max_spread_bps: 6.0
+  min_price: 0.0000001
+  # Symbols never traded (e.g. delisting announced). Empty by default.
+  deny_list: []
+  # Optional allow-list. Empty means "consider the whole universe".
+  allow_list: []
+  # Number of klines fetched per symbol per timeframe for scoring.
+  scoring_lookback_bars: 200
+  # Order-book depth level used for imbalance (0 disables).
+  depth_limit: 20
+
+  # Weights for the composite market score. Normalised internally, so relative
+  # magnitude is what matters.
+  weights:
+    liquidity: 0.16
+    volume: 0.10
+    recent_volume: 0.08
+    spread: 0.12
+    volatility: 0.12
+    momentum: 0.08
+    trend: 0.08
+    volume_anomaly: 0.06
+    breakout_potential: 0.06
+    mean_reversion_potential: 0.04
+    funding: 0.04
+    structure: 0.03
+    book_imbalance: 0.03
+  # Penalties subtracted after the weighted sum (points out of 100).
+  penalties:
+    estimated_cost: 20.0
+    risk: 15.0
+
+  # Volatility sweet spot for scalping, as ATR/price. Too low = no move to
+  # capture, too high = stops get hit by noise.
+  volatility_target_low: 0.0025
+  volatility_target_high: 0.015
+
+timeframes:
+  primary: 5m
+  fast: 1m
+  entry: 3m
+  context: 15m
+  higher: 1h
+  # Bars retained in memory per symbol per timeframe.
+  history_bars: 500
+
+regime:
+  adx_period: 14
+  adx_strong_trend: 28.0
+  adx_weak_trend: 18.0
+  atr_period: 14
+  # ATR percentile (over regime_lookback) above/below which volatility is
+  # classified as high/low.
+  high_volatility_percentile: 0.80
+  low_volatility_percentile: 0.20
+  regime_lookback: 200
+  bb_period: 20
+  bb_std: 2.0
+  # Bollinger bandwidth below this fraction = squeeze -> breakout candidate.
+  squeeze_bandwidth: 0.02
+  breakout_lookback: 20
+  panic_return_threshold: 0.04
+  panic_window_bars: 5
+  panic_volume_multiple: 5.0
+
+  # Which strategies may run in each regime, and their weight multiplier.
+  # A strategy absent from a regime does not run in that regime at all.
+  strategy_weights:
+    STRONG_TREND:   {momentum: 1.0, trend_following: 1.0, breakout: 0.8, vwap: 0.4}
+    WEAK_TREND:     {momentum: 0.6, trend_following: 0.7, vwap: 0.6, support_resistance: 0.5}
+    SIDEWAYS:       {mean_reversion: 1.0, vwap: 0.9, support_resistance: 0.8}
+    HIGH_VOLATILITY: {breakout: 1.0, volatility_expansion: 1.0, momentum: 0.5}
+    LOW_VOLATILITY: {mean_reversion: 0.7, vwap: 0.7, support_resistance: 0.6}
+    BREAKOUT:       {breakout: 1.0, volatility_expansion: 0.9, volume_spike: 0.8, momentum: 0.7}
+    PANIC:          {}          # no new entries in panic regime
+
+aggregator:
+  # Minimum weighted consensus (0..100) required to consider an opportunity.
+  min_consensus: 55.0
+  # Minimum number of agreeing strategies.
+  min_agreeing_strategies: 2
+  # If opposing weighted confidence exceeds this fraction of the agreeing side,
+  # the opportunity is rejected as conflicted.
+  max_conflict_ratio: 0.45
+  # Confidence below this is treated as no opinion.
+  min_signal_confidence: 50.0
+
+opportunity:
+  # Composite 0..100. Below this the opportunity is rejected.
+  min_score: 70.0
+  exceptional: 90.0
+  strong: 80.0
+  moderate: 70.0
+  weights:
+    market_quality: 0.18
+    consensus: 0.26
+    momentum: 0.08
+    volume: 0.08
+    trend: 0.06
+    liquidity: 0.10
+    volatility_fit: 0.08
+    execution_quality: 0.08
+    risk_reward: 0.08
+  penalties:
+    cost: 25.0
+    correlation: 20.0
+
+edge:
+  # Fee rates. Verify against your actual VIP tier and BNB-discount status.
+  taker_fee: 0.0004
+  maker_fee: 0.0002
+  # Assume taker entries and taker exits unless a strategy says otherwise.
+  assume_taker_entry: true
+  assume_taker_exit: true
+  # Slippage model: base + impact_coefficient * (order_notional / depth_notional)
+  base_slippage_bps: 1.0
+  impact_coefficient: 0.5
+  # Fraction of the quoted spread paid on a marketable order.
+  spread_cost_fraction: 0.5
+  # Funding is charged if the position is expected to straddle a funding time.
+  funding_interval_hours: 8
+  # Minimum expected NET edge, as a fraction of notional, required to trade.
+  # 0.0008 = 0.08%. This is the single most important gate in the system.
+  min_expected_edge: 0.0008
+  # Probability of hitting target before stop is estimated from the strategy's
+  # historical win rate, shrunk toward this prior until enough samples exist.
+  win_rate_prior: 0.45
+  win_rate_prior_weight: 40.0
+
+trade:
+  max_duration_sec: 3600        # hard 60 minute cap
+  # Exit early if the remaining expected edge turns negative.
+  exit_on_negative_edge: true
+  exit_on_regime_change: true
+  exit_on_signal_flip: true
+
+stops:
+  # Stop distance = atr_multiple * ATR, then clamped to [min_pct, max_pct] and
+  # widened if it would sit inside recent market structure.
+  atr_period: 14
+  atr_multiple: 1.5
+  min_stop_pct: 0.0020
+  max_stop_pct: 0.0150
+  # Respect swing high/low within this many bars when placing the stop.
+  structure_lookback: 20
+  structure_buffer_atr: 0.25
+
+targets:
+  # Base reward:risk. Raised in trending regimes, lowered in chop.
+  base_rr: 1.6
+  min_rr: 1.1
+  max_rr: 4.0
+  atr_multiple_cap: 4.0
+  partial_take_profit:
+    enabled: false            # enable only if backtest shows it helps
+    first_target_rr: 1.0
+    first_target_fraction: 0.5
+    move_stop_to_breakeven: true
+
+trailing_stop:
+  enabled: true
+  # Activate only after this much profit, measured in R (risk multiples).
+  activation_r: 1.0
+  # Trail distance in ATR multiples. Wider than the initial stop on purpose:
+  # a tight trail converts winners into scratches.
+  atr_multiple: 1.8
+  # Never trail to worse than breakeven once activated.
+  never_below_breakeven: true
+
+allocation:
+  # Risk budget distribution across strategies.
+  enabled: true
+  min_weight: 0.4       # a strategy never drops below 40% of equal weight
+  max_weight: 2.0       # nor rises above 2x equal weight
+  lookback_trades: 100
+  # Weight is driven by expectancy; requires this many trades before it moves
+  # away from equal weight.
+  min_trades_for_adjustment: 30
+
+strategy_kill_switch:
+  enabled: true
+  lookback_trades: 100
+  min_trades: 40
+  min_profit_factor: 0.85
+  max_drawdown: 0.08
+  min_expectancy: -0.0005
+  disable_seconds: 21600     # 6 hours
+
+execution:
+  # MARKET or LIMIT for entries. LIMIT uses a marketable limit at
+  # best ± limit_offset_bps and cancels after limit_timeout_sec.
+  entry_order_type: MARKET
+  limit_offset_bps: 1.0
+  limit_timeout_sec: 5
+  # Protective stop is placed as STOP_MARKET reduceOnly immediately after fill.
+  stop_order_type: STOP_MARKET
+  take_profit_order_type: TAKE_PROFIT_MARKET
+  # Reject a fill whose slippage exceeded this and flatten immediately.
+  max_entry_slippage: 0.0030
+  # Retry policy for transient REST failures.
+  max_retries: 3
+  retry_backoff_sec: 0.5
+  # Reconciliation cadence.
+  reconcile_interval_sec: 60
+  # Position monitor cadence.
+  monitor_interval_sec: 1
+  # Refuse to trade a symbol whose min notional exceeds this fraction of equity.
+  max_min_notional_ratio: 0.5
+
+paper:
+  # Simulated execution realism. Deliberately pessimistic.
+  latency_ms: 120
+  latency_jitter_ms: 80
+  slippage_bps: 1.5
+  adverse_slippage_probability: 0.65
+  partial_fill_probability: 0.10
+  reject_probability: 0.005
+  # Apply funding to positions crossing a funding timestamp.
+  apply_funding: true
+
+backtest:
+  taker_fee: 0.0004
+  maker_fee: 0.0002
+  slippage_bps: 1.5
+  spread_bps: 1.0
+  apply_funding: true
+  # Fill model: 'next_open' fills at the next bar's open (no look-ahead).
+  fill_model: next_open
+  # Intrabar stop/target resolution when both are touched in one bar.
+  # 'pessimistic' assumes the stop is hit first. Use this.
+  intrabar: pessimistic
+  warmup_bars: 250
+
+walk_forward:
+  train_days: 30
+  validation_days: 7
+  test_days: 7
+  step_days: 7
+  min_trades_per_fold: 20
+
+monte_carlo:
+  iterations: 2000
+  # Resample trade order with replacement.
+  method: bootstrap
+  drawdown_percentile: 0.05
+
+database:
+  # Retention in days; 0 = keep forever.
+  market_snapshot_retention_days: 14
+  signal_retention_days: 30
+  decision_retention_days: 90
+  prune_interval_sec: 3600
+
+health:
+  heartbeat_interval_sec: 5
+  # Component silent for longer than this is considered failed.
+  component_timeout_sec: 60
+  memory_warn_mb: 900
+  cpu_warn_pct: 85.0
+
+ai:
+  # Advisory only. Can never place, size or approve an order.
+  enabled: false
+  anomaly_detection: true
+  post_trade_analysis: true

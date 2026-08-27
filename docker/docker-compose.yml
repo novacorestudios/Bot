@@ -1,0 +1,51 @@
+# Deployment for a single small VPS.
+#   docker compose --env-file ../.env -f docker-compose.yml up -d
+services:
+  tradebot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: tradebot:latest
+    container_name: tradebot
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      # Defaults; anything set in .env wins.
+      TRADING_MODE: ${TRADING_MODE:-PAPER}
+      BINANCE_TESTNET: ${BINANCE_TESTNET:-true}
+      DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:///data/tradebot.db}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      DASHBOARD_PORT: ${DASHBOARD_PORT:-8080}
+    volumes:
+      - tradebot-data:/app/data
+      - tradebot-logs:/app/logs
+      - tradebot-reports:/app/reports
+      # Config is mounted read-only: the container can never rewrite its own limits.
+      - ../config:/app/config:ro
+    ports:
+      # Bound to loopback. Put a reverse proxy with TLS in front for remote access.
+      - "127.0.0.1:${DASHBOARD_PORT:-8080}:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  tradebot-data:
+  tradebot-logs:
+  tradebot-reports:

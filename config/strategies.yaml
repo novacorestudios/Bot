@@ -1,0 +1,126 @@
+# =============================================================================
+# Per-strategy parameters. All values are STARTING POINTS, not optimised.
+# `enabled: false` removes a strategy from the engine entirely.
+# Regime gating (which strategies run in which regime) lives in config.yaml
+# under regime.strategy_weights — a strategy enabled here still only runs in the
+# regimes that list it.
+# =============================================================================
+
+momentum:
+  enabled: true
+  timeframe: 3m
+  confirm_timeframe: 15m
+  roc_period: 10
+  roc_threshold: 0.0035        # 0.35% move over roc_period bars
+  ema_fast: 9
+  ema_slow: 21
+  rsi_period: 14
+  rsi_long_min: 52.0
+  rsi_long_max: 78.0           # refuse to chase into exhaustion
+  rsi_short_min: 22.0
+  rsi_short_max: 48.0
+  volume_multiple: 1.3         # current volume vs average
+  min_confidence: 55.0
+  atr_stop_multiple: 1.4
+  base_rr: 1.7
+
+trend_following:
+  enabled: true
+  timeframe: 5m
+  confirm_timeframe: 1h
+  ema_fast: 20
+  ema_slow: 50
+  adx_period: 14
+  adx_min: 22.0
+  # Enter on a pullback to the fast EMA rather than at the extreme.
+  pullback_atr: 0.8
+  min_confidence: 55.0
+  atr_stop_multiple: 1.8
+  base_rr: 2.0
+
+breakout:
+  enabled: true
+  timeframe: 3m
+  lookback: 20
+  # Price must clear the range extreme by this fraction of ATR.
+  breakout_atr_buffer: 0.15
+  # Range must have been compressed beforehand (Bollinger bandwidth).
+  max_prior_bandwidth: 0.030
+  volume_multiple: 1.6
+  # Reject if the breakout bar is already extended this far beyond the level.
+  max_extension_atr: 1.2
+  min_confidence: 58.0
+  atr_stop_multiple: 1.3
+  base_rr: 2.0
+
+mean_reversion:
+  enabled: true
+  timeframe: 3m
+  bb_period: 20
+  bb_std: 2.2
+  rsi_period: 14
+  rsi_oversold: 26.0
+  rsi_overbought: 74.0
+  # Only fade when the higher timeframe is NOT trending against us.
+  max_adx: 22.0
+  adx_period: 14
+  # Distance from the mean, in ATR, required to consider the move stretched.
+  min_stretch_atr: 1.5
+  min_confidence: 55.0
+  atr_stop_multiple: 1.2
+  base_rr: 1.3
+
+volume_spike:
+  enabled: true
+  timeframe: 1m
+  volume_lookback: 30
+  volume_multiple: 3.0
+  # The spike bar must also have a decisive body, not a wick-only bar.
+  min_body_fraction: 0.55
+  # Confirm direction with the following bar's continuation.
+  confirm_bars: 1
+  min_confidence: 55.0
+  atr_stop_multiple: 1.3
+  base_rr: 1.6
+
+volatility_expansion:
+  enabled: true
+  timeframe: 3m
+  atr_period: 14
+  atr_lookback: 60
+  # Current ATR relative to its own recent median.
+  expansion_multiple: 1.6
+  # Direction is taken from the expansion bar's structure.
+  min_directional_fraction: 0.6
+  min_confidence: 55.0
+  atr_stop_multiple: 1.6
+  base_rr: 1.8
+
+vwap:
+  enabled: true
+  timeframe: 3m
+  # Session VWAP resets at this UTC hour.
+  session_reset_hour_utc: 0
+  # Number of standard deviations from VWAP for the entry band.
+  band_std: 1.8
+  # Mean-reversion toward VWAP (fade) or continuation from VWAP (ride).
+  mode: fade
+  max_adx: 24.0
+  adx_period: 14
+  min_confidence: 55.0
+  atr_stop_multiple: 1.2
+  base_rr: 1.4
+
+support_resistance:
+  enabled: true
+  timeframe: 5m
+  lookback: 60
+  # A level needs this many touches to count.
+  min_touches: 2
+  # Touches within this fraction of ATR are the same level.
+  cluster_atr: 0.4
+  # Enter on rejection from the level, within this distance.
+  entry_distance_atr: 0.5
+  min_confidence: 55.0
+  atr_stop_multiple: 1.2
+  base_rr: 1.8

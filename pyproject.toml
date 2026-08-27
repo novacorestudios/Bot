@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradebot"
+version = "0.1.0"
+description = "Dynamic Multi-Strategy Binance USDⓈ-M Futures Short-Term Trading Engine"
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+tradebot = "tradebot.app.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+markers = [
+    "slow: long-running tests",
+    "network: requires outbound access to Binance (skipped by default)",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM", "RET", "ARG", "PIE"]
+ignore = ["E501", "B008", "SIM108", "RET504", "ARG002"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["tradebot"]
+mypy_path = "src"
+ignore_missing_imports = true
+warn_unused_ignores = false
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+
+[tool.coverage.run]
+source = ["src/tradebot"]
+omit = ["*/dashboard/*"]
