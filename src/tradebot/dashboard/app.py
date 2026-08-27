@@ -23,7 +23,7 @@ from tradebot.core.logging import get_logger
 log = get_logger(__name__)
 
 
-def create_app(engine: Any, token: str = "") -> FastAPI:
+def create_app(engine: Any, token: str = "") -> FastAPI:  # nosec B107
     """Build the dashboard app around a running engine."""
     app = FastAPI(title="tradebot", docs_url=None, redoc_url=None, openapi_url=None)
 

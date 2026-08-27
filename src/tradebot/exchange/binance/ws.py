@@ -115,7 +115,9 @@ class _ReconnectingStream:
             # reconnect in lockstep and trigger rate limits.
             attempt += 1
             base = min(self.max_backoff, 1.0 * (2 ** min(attempt, 6)))
-            delay = base * (0.5 + random.random() * 0.5)  # noqa: S311 - jitter, not crypto
+            # Jitter, not cryptography: without it every bot on a host
+            # reconnects in lockstep after a Binance restart and is rate limited.
+            delay = base * (0.5 + random.random() * 0.5)  # noqa: S311  # nosec B311
             log.info(
                 "ws_reconnecting", stream=self.name, attempt=attempt, delay_sec=round(delay, 2)
             )

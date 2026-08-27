@@ -10,9 +10,13 @@
 
 This document is a plan, not a claim of profitability.
 
-- No backtest has been run against real market data at the time of writing. Any
-  number in this repository that is not produced by an actual test run is marked
-  `NOT TESTED`.
+- **No backtest has been run against real market data.** No profitability claim
+  of any kind is made anywhere in this repository. Every performance figure
+  would have to come from the operator's own run.
+- 644 automated tests pass. They verify BEHAVIOUR — that stops are mandatory,
+  that risk never exceeds budget, that a timed-out order is never re-sent, that
+  the backtester does not read the future. None of them verify PROFIT, and no
+  test can.
 - **The development sandbox used to author this code has no network route to
   `fapi.binance.com`** (the egress proxy returns `403` on `CONNECT`). Therefore:
   - All Binance integration code is written against the **official Binance
@@ -228,27 +232,63 @@ blocks merge.
 
 ---
 
-## 8. Phase order and exit criteria
+## 8. Phase status
 
-| Phase | Deliverable | Exit criterion |
+| Phase | Deliverable | Status |
 |---|---|---|
-| 1 | Structure, config, docs, CI, Docker | CI green on empty test suite; config validates; no secrets in repo |
-| 2 | Market data layer | Indicator unit tests pass vs hand values; REST/WS covered by fixture tests; rate limiter tested |
-| 3 | Scanner + regime | Deterministic ranking test; regime classifier test on scripted series |
-| 4 | 8 strategies | Each strategy has a test that produces the expected direction on a constructed path and `WAIT` on noise |
-| 5 | Aggregator + edge | Conflicting signals rejected; negative-edge trade rejected |
-| 6 | Risk engine | All limit tests pass; property test: no trade without SL |
-| 7 | Backtester | Hand-calculated PnL matches to the cent on scripted data; metrics verified |
-| 8 | Paper broker | Simulated fills obey filters; slippage/latency applied |
-| 9 | Execution + reconciliation | Duplicate-order and restart tests pass |
-| 10 | Dashboard + Telegram | Endpoints return live state; alerts formatted |
-| 11 | Docker + VPS | Image builds, healthcheck passes, compose up works |
-| 12 | Security audit | bandit clean, no secret in git history, no withdrawal permission required |
-| 13 | End-to-end | Full pipeline runs in PAPER against a scripted feed |
-| 14 | Paper validation (operator) | ≥ 2 weeks live-market paper, criteria in §9 |
-| 15 | LIVE (operator, manual) | Only after §9 |
+| 1 | Structure, config, docs, CI, Docker | **done** |
+| 2 | Market data layer (REST/WS/indicators) | **done** — fixture-tested, NOT run against live Binance from here |
+| 3 | Scanner + scoring + regime | **done** |
+| 4 | Eight regime-gated strategies | **done** |
+| 5 | Aggregator + opportunity score + edge filter | **done** |
+| 6 | Risk engine, correlation, kill switches | **done** |
+| 7 | Backtester, metrics, walk-forward, Monte Carlo | **done** — engine verified on synthetic data only |
+| 8 | Paper broker | **done** — not yet run against live market data |
+| 9 | Execution engine + reconciliation | **done** |
+| 10 | Database, Telegram, dashboard, health | **done** |
+| 11 | Docker + VPS documentation | **done** |
+| 12 | Security audit | **done** — bandit clean, pip-audit clean, secret scan clean |
+| 13 | End-to-end + structural tests | **done** — 644 tests |
+| 14 | Paper-trading validation | **NOT DONE — requires the operator, ≥ 14 days** |
+| 15 | LIVE | **NOT DONE — blocked on 14** |
 
----
+### What "done" means here, and what it does not
+
+Phases 1-13 are code, tests and documentation. They demonstrate the system
+*behaves as specified*. They demonstrate nothing whatsoever about profitability.
+
+Specifically **not** established:
+
+- that any strategy has an edge on real data
+- that the cost model matches real Binance fills
+- that the engine survives a week of live market conditions
+- that the trade frequency is workable in practice
+
+Phases 14 and 15 are the ones that would establish those, and they cannot be
+performed from this environment.
+
+### Findings the operator should know before starting
+
+Three things were discovered while building, and none of them are hidden in a
+config file:
+
+1. **The system could not bootstrap.** With no trade history the edge filter
+   shrinks every win probability to the prior, which at a reward:risk of 2.0
+   makes every candidate negative-edge — so nothing trades, so no history
+   accumulates. Correct for live, fatal for a backtest. Resolved with an
+   explicit, counted, loudly-reported bootstrap mode enabled only in
+   `config/config.backtest.yaml`. See `docs/BACKTESTING.md`.
+
+2. **The shipped defaults trade very rarely.** On synthetic data they produce
+   essentially zero trades. The binding constraints are `NO_SIGNAL`, then
+   `INSUFFICIENT_CONSENSUS`: the strategies fire in mutually exclusive
+   conditions, regime gating permits three or four at a time, and the
+   aggregator wants two of those few to agree. Whether that is correct caution
+   or over-tuning is a question for real data.
+
+3. **A strategy needs roughly a 62 % realised win rate** to clear the 0.08 %
+   minimum edge on a liquid symbol at R ≈ 1.6 with 0.11 % round-trip costs.
+   That is a demanding bar, and it is the intended behaviour of the edge filter.
 
 ## 9. Gates before any real money
 

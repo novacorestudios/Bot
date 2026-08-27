@@ -96,7 +96,9 @@ class PaperBroker:
         self.taker_fee = taker_fee
         self.maker_fee = maker_fee
         self.clock = clock or SystemClock()
-        self._rng = random.Random(seed)  # noqa: S311 - simulation, not crypto
+        # Simulation, not cryptography — and seedable on purpose, so a paper
+        # run can be reproduced exactly when diagnosing a fill.
+        self._rng = random.Random(seed)  # noqa: S311  # nosec B311
 
         self.account = PaperAccount(balance=initial_balance, equity=initial_balance)
         self.orders: dict[str, Order] = {}

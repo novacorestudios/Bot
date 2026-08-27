@@ -103,7 +103,7 @@ class BinanceFuturesREST:
     def __init__(
         self,
         api_key: str = "",
-        api_secret: str = "",
+        api_secret: str = "",  # nosec B107 - empty default; public endpoints only
         base_url: str = "https://testnet.binancefuture.com",
         recv_window: int = 5000,
         timeout_sec: float = 10.0,

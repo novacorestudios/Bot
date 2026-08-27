@@ -518,7 +518,10 @@ class Settings(BaseSettings):
     telegram_enabled: bool = False
 
     dashboard_enabled: bool = True
-    dashboard_host: str = "0.0.0.0"  # noqa: S104 - intended, gated by token
+    # Binding to all interfaces is intentional but NOT the effective default:
+    # app/runner.py overrides this to 127.0.0.1 whenever dashboard_token is
+    # empty, so an unauthenticated dashboard is never reachable off-host.
+    dashboard_host: str = "0.0.0.0"  # noqa: S104  # nosec B104
     dashboard_port: int = 8080
     dashboard_token: str = ""
 

@@ -153,7 +153,17 @@ class SignalPipeline:
             )
 
         signal = aggregation.signal
-        assert signal is not None
+        if signal is None:
+            # Unreachable via AggregationResult's contract, but an assert would
+            # be stripped under -O and turn this into an AttributeError several
+            # frames away. A rejection with a reason is the safe failure.
+            return self._reject(
+                symbol,
+                RejectionReason.NO_SIGNAL,
+                "aggregation reported success without producing a signal",
+                "aggregation",
+                signals,
+            )
 
         # -- 3. expected net edge -------------------------------------------
         # Computed BEFORE the opportunity score because the opportunity score
