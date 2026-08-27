@@ -17,23 +17,50 @@ REPO = Path(__file__).resolve().parents[1]
 
 # Patterns that indicate a real secret, not a placeholder.
 PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("Binance API key/secret assignment",
-     re.compile(r"""(?i)\b(api[_-]?key|api[_-]?secret)\b\s*[:=]\s*["'][A-Za-z0-9]{30,}["']""")),
-    ("Telegram bot token",
-     re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b")),
-    ("Generic 64-char hex secret",
-     re.compile(r"""(?i)\bsecret\b\s*[:=]\s*["'][A-Fa-f0-9]{48,}["']""")),
-    ("Private key block",
-     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
-    ("AWS access key id",
-     re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    (
+        "Binance API key/secret assignment",
+        re.compile(r"""(?i)\b(api[_-]?key|api[_-]?secret)\b\s*[:=]\s*["'][A-Za-z0-9]{30,}["']"""),
+    ),
+    ("Telegram bot token", re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b")),
+    (
+        "Generic 64-char hex secret",
+        re.compile(r"""(?i)\bsecret\b\s*[:=]\s*["'][A-Fa-f0-9]{48,}["']"""),
+    ),
+    ("Private key block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
+    ("AWS access key id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
 ]
 
-SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "data",
-             "logs", "reports", ".pytest_cache", ".ruff_cache", ".mypy_cache"}
+SKIP_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    "data",
+    "logs",
+    "reports",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+}
 SKIP_FILES = {"check_secrets.py"}
-TEXT_SUFFIXES = {".py", ".yaml", ".yml", ".json", ".toml", ".md", ".txt", ".sh",
-                 ".env", ".ini", ".cfg", ".example", ".html", ".js", ".Dockerfile"}
+TEXT_SUFFIXES = {
+    ".py",
+    ".yaml",
+    ".yml",
+    ".json",
+    ".toml",
+    ".md",
+    ".txt",
+    ".sh",
+    ".env",
+    ".ini",
+    ".cfg",
+    ".example",
+    ".html",
+    ".js",
+    ".Dockerfile",
+}
 
 
 def tracked_files() -> list[Path]:
@@ -78,7 +105,10 @@ def main() -> int:
     if env_path.exists():
         tracked = subprocess.run(  # noqa: S603
             ["git", "ls-files", "--error-unmatch", ".env"],
-            cwd=REPO, capture_output=True, text=True, check=False
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if tracked.returncode == 0:
             findings.append(".env: committed to git — remove it and rotate the keys")

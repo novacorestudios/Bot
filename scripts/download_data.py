@@ -50,15 +50,17 @@ def parse_date(text: str) -> int:
     raise SystemExit(f"cannot parse date: {text!r} (use YYYY-MM-DD)")
 
 
-async def fetch_range(client: BinanceFuturesREST, symbol: str, interval: str,
-                      start_ms: int, end_ms: int) -> list:
+async def fetch_range(
+    client: BinanceFuturesREST, symbol: str, interval: str, start_ms: int, end_ms: int
+) -> list:
     """Page through klines, respecting the 1500-per-request cap."""
     step = Timeframe(interval).milliseconds
     out: list = []
     cursor = start_ms
     while cursor < end_ms:
-        batch = await client.get_klines(symbol, interval, limit=MAX_PER_REQUEST,
-                                        start_ms=cursor, end_ms=end_ms)
+        batch = await client.get_klines(
+            symbol, interval, limit=MAX_PER_REQUEST, start_ms=cursor, end_ms=end_ms
+        )
         if not batch:
             break
         # Only keep fully closed bars; a forming bar would poison the backtest.
@@ -68,7 +70,7 @@ async def fetch_range(client: BinanceFuturesREST, symbol: str, interval: str,
         out.extend(batch)
         advanced = batch[-1].open_time + step
         if advanced <= cursor:
-            break                       # no progress; avoid an infinite loop
+            break  # no progress; avoid an infinite loop
         cursor = advanced
         if len(out) % 15000 < MAX_PER_REQUEST:
             log.info("downloading", symbol=symbol, interval=interval, bars=len(out))
@@ -111,30 +113,34 @@ def write_frame(candles: list, path: Path, fmt: str) -> int:
 
 
 async def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--symbols", default="",
-                        help="Comma-separated symbols. Omit to use --top.")
-    parser.add_argument("--top", type=int, default=0,
-                        help="Instead of --symbols, take the N highest 24h-volume "
-                             "USDT perpetuals.")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--symbols", default="", help="Comma-separated symbols. Omit to use --top.")
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=0,
+        help="Instead of --symbols, take the N highest 24h-volume USDT perpetuals.",
+    )
     parser.add_argument("--timeframes", default="1m,3m,5m,15m,1h")
     parser.add_argument("--start", required=True, help="YYYY-MM-DD (UTC, inclusive)")
-    parser.add_argument("--end", default="", help="YYYY-MM-DD (UTC, exclusive). "
-                                                  "Defaults to now.")
+    parser.add_argument("--end", default="", help="YYYY-MM-DD (UTC, exclusive). Defaults to now.")
     parser.add_argument("--out", default="data/klines")
     parser.add_argument("--format", choices=["parquet", "csv"], default="parquet")
-    parser.add_argument("--funding", action="store_true", default=True,
-                        help="Also download funding-rate history (default on)")
+    parser.add_argument(
+        "--funding",
+        action="store_true",
+        default=True,
+        help="Also download funding-rate history (default on)",
+    )
     args = parser.parse_args()
 
     configure_logging("INFO", "console", None)
     settings = Settings()
 
     start_ms = parse_date(args.start)
-    end_ms = parse_date(args.end) if args.end else int(
-        datetime.now(tz=UTC).timestamp() * 1000
-    )
+    end_ms = parse_date(args.end) if args.end else int(datetime.now(tz=UTC).timestamp() * 1000)
     if end_ms <= start_ms:
         raise SystemExit("--end must be after --start")
 
@@ -146,8 +152,10 @@ async def main() -> int:
             raise SystemExit(f"unsupported timeframe: {tf}") from None
 
     client = BinanceFuturesREST(
-        api_key=settings.binance_api_key, api_secret=settings.binance_api_secret,
-        base_url=settings.rest_url, recv_window=settings.binance_recv_window,
+        api_key=settings.binance_api_key,
+        api_secret=settings.binance_api_secret,
+        base_url=settings.rest_url,
+        recv_window=settings.binance_recv_window,
     )
     await client.connect()
 
@@ -160,14 +168,15 @@ async def main() -> int:
         elif args.top:
             tickers = await client.get_ticker_24h()
             eligible = [
-                (t.quote_volume, t.symbol) for t in tickers.values()
+                (t.quote_volume, t.symbol)
+                for t in tickers.values()
                 if (info := client.symbol_info(t.symbol)) is not None
-                and info.is_tradable and info.quote_asset == "USDT"
+                and info.is_tradable
+                and info.quote_asset == "USDT"
             ]
             eligible.sort(reverse=True)
             symbols = [symbol for _, symbol in eligible[: args.top]]
-            log.info("selected_by_volume", count=len(symbols),
-                     symbols=symbols[:10])
+            log.info("selected_by_volume", count=len(symbols), symbols=symbols[:10])
         else:
             raise SystemExit("pass either --symbols or --top")
 
@@ -180,8 +189,7 @@ async def main() -> int:
                 path = out_dir / interval / f"{symbol}.{suffix}"
                 written = write_frame(candles, path, args.format)
                 total_bars += written
-                log.info("written", symbol=symbol, interval=interval,
-                         bars=written, path=str(path))
+                log.info("written", symbol=symbol, interval=interval, bars=written, path=str(path))
 
             if args.funding:
                 try:
