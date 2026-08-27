@@ -108,6 +108,11 @@ class EdgeCalculator:
         self.config = config
         self.cost_model = cost_model
         self._stats: dict[str, StrategyStats] = {}
+        #: How many edge estimates used an ASSUMED win rate rather than a
+        #: measured one. Reported so a backtest result cannot be mistaken for
+        #: evidence when it in fact rests on assumptions.
+        self.bootstrap_estimates = 0
+        self.bootstrap_strategies: set[str] = set()
 
     # ------------------------------------------------------------------ #
     # Win probability
@@ -130,30 +135,72 @@ class EdgeCalculator:
         self.stats_for(strategy).record(won, gross_return, expected_edge, realised_edge)
 
     def win_probability(self, strategy: str, reward_risk: float = 0.0) -> float:
-        """Shrunk estimate of P(target before stop).
+        """Shrunk estimate of P(target before stop), from realised history.
 
-        With few trades the estimate sits at the prior; it moves toward the
+        With few trades the estimate sits at the prior and moves toward the
         observed rate as evidence accumulates. Without this, a strategy with a
         lucky first ten trades would be trusted with real size.
 
         When there is no history at all, the prior is additionally adjusted for
         the reward:risk being attempted — a 3:1 target is inherently reached
-        less often than a 1:1 one, and using a flat prior for both would make
-        every ambitious target look artificially attractive.
+        less often than a 1:1 one, and a flat prior for both would make every
+        ambitious target look artificially attractive.
         """
         stats = self.stats_for(strategy)
         prior = self.config.win_rate_prior
         prior_weight = self.config.win_rate_prior_weight
 
         if stats.trades == 0 and reward_risk > 0:
-            # A rough geometric adjustment: P ≈ 1/(1+RR) is the break-even rate;
-            # the prior is expressed as a multiple of that break-even level.
             breakeven = 1.0 / (1.0 + reward_risk)
             reference_breakeven = 1.0 / (1.0 + 1.6)  # the configured base RR
             prior = clamp(prior * (breakeven / reference_breakeven), 0.05, 0.95)
 
         blended = (stats.wins + prior * prior_weight) / (stats.trades + prior_weight)
         return clamp(blended, 0.01, 0.99)
+
+    def bootstrap_probability(
+        self, strategy: str, gross_win: float, gross_loss: float, cost_total: float
+    ) -> float:
+        """The ASSUMED win rate used to break the cold-start deadlock.
+
+        Shrinking an unproven strategy's win rate toward the prior makes every
+        candidate negative-edge at a reward:risk of 2.0 or more. Nothing is
+        taken, so no evidence accumulates, so the estimate never moves: the
+        system cannot start. That is correct for live trading — do not risk
+        money on an unproven strategy — but fatal in a backtest, where
+        measuring the win rate is the entire purpose.
+
+        So in bootstrap mode the strategy is assumed to be *just good enough to
+        be worth measuring*: its exact break-even rate after costs,
+
+            p_breakeven = (loss + costs) / (win + loss)
+
+        plus ``bootstrap_win_rate_margin``. As real trades arrive the assumption
+        is blended out in favour of the observed rate, so the estimate migrates
+        to reality rather than jumping when the trade count crosses a threshold.
+
+        Every call is counted in ``bootstrap_estimates``. A backtest that used
+        them is reporting what WOULD happen if the assumption held — not
+        evidence that it does.
+        """
+        stats = self.stats_for(strategy)
+        self.bootstrap_estimates += 1
+        self.bootstrap_strategies.add(strategy)
+
+        breakeven = self.breakeven_win_rate(gross_win, gross_loss, _flat_costs(cost_total))
+        assumed = clamp(breakeven + self.config.bootstrap_win_rate_margin, 0.01, 0.95)
+
+        if stats.trades > 0:
+            weight = clamp(stats.trades / max(1, self.config.bootstrap_min_trades), 0.0, 1.0)
+            assumed = assumed * (1 - weight) + stats.observed_win_rate * weight
+        return clamp(assumed, 0.01, 0.99)
+
+    def uses_bootstrap(self, strategy: str) -> bool:
+        """Whether this strategy's estimate would rest on an assumption."""
+        return (
+            self.config.bootstrap_enabled
+            and self.stats_for(strategy).trades < self.config.bootstrap_min_trades
+        )
 
     # ------------------------------------------------------------------ #
     # Edge
@@ -193,6 +240,15 @@ class EdgeCalculator:
             expected_duration_sec=expected_duration_sec,
             seconds_to_funding=seconds_to_funding,
         )
+
+        # Resolved AFTER costs: the bootstrap assumption is anchored to the
+        # break-even rate net of those costs, which needs the target size.
+        if win_probability is not None:
+            p = win_probability
+        elif self.uses_bootstrap(name):
+            p = self.bootstrap_probability(name, gross_win, gross_loss, costs.total)
+        else:
+            p = self.win_probability(name, reward_risk)
 
         expected_gross = p * gross_win - (1.0 - p) * gross_loss
         # Funding can be negative (received), so it is added rather than
@@ -283,6 +339,47 @@ class EdgeCalculator:
 
     def summary(self) -> dict[str, dict[str, float]]:
         return {name: self.realised_vs_expected(name) for name in self._stats}
+
+    def export_stats(self) -> dict[str, dict[str, float]]:
+        """Measured per-strategy statistics, for seeding another run.
+
+        This is how a validated backtest hands its measurements to live
+        trading: live never bootstraps, so it must START from evidence rather
+        than gather it with real money.
+        """
+        return {
+            name: {
+                "trades": stats.trades,
+                "wins": stats.wins,
+                "gross_win_sum": stats.gross_win_sum,
+                "gross_loss_sum": stats.gross_loss_sum,
+            }
+            for name, stats in self._stats.items()
+        }
+
+    def seed_from(self, exported: dict[str, dict[str, float]]) -> None:
+        """Load measured statistics produced by a previous validated run."""
+        for name, values in exported.items():
+            stats = self.stats_for(name)
+            stats.trades = int(values.get("trades", 0))
+            stats.wins = int(values.get("wins", 0))
+            stats.gross_win_sum = float(values.get("gross_win_sum", 0.0))
+            stats.gross_loss_sum = float(values.get("gross_loss_sum", 0.0))
+        log.info(
+            "edge_stats_seeded",
+            strategies=sorted(exported),
+            total_trades=sum(int(v.get("trades", 0)) for v in exported.values()),
+        )
+
+    @property
+    def bootstrap_active(self) -> bool:
+        """True when estimates may rest on assumptions rather than measurement."""
+        return self.config.bootstrap_enabled
+
+
+def _flat_costs(total: float) -> CostEstimate:
+    """Wrap a scalar cost total in a CostEstimate for the break-even helper."""
+    return CostEstimate(total, 0.0, 0.0, 0.0, 0.0)
 
 
 def _zero_edge() -> EdgeEstimate:

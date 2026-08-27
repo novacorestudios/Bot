@@ -212,6 +212,79 @@ def flat_prices(
     return [price * (1 + rng.gauss(0, noise)) for i in range(n)]
 
 
+def realistic_volumes(prices: list[float], base: float = 1000.0, seed: int = 21) -> list[float]:
+    """Volume that varies with price movement, as real markets do.
+
+    Constant volume is not a neutral simplification: it pins ``volume_ratio`` at
+    1.0 and ``volume_zscore`` at nan, which systematically depresses the volume
+    and volume-anomaly components of both the market score and the opportunity
+    score. A fixture built that way cannot reach the acceptance threshold no
+    matter how good the price action is — the strategy looks broken when the
+    data is.
+    """
+    rng = random.Random(seed)
+    out: list[float] = []
+    for i, price in enumerate(prices):
+        move = abs(price / prices[i - 1] - 1.0) if i else 0.0
+        # Volume clusters around movement, plus a lognormal-ish base.
+        multiplier = 1.0 + move * 400.0 + abs(rng.gauss(0, 0.45))
+        out.append(base * multiplier)
+    return out
+
+
+def resample(candles: list[Candle], factor: int) -> list[Candle]:
+    """Aggregate 1-minute candles into a coarser timeframe.
+
+    Reusing one series for every timeframe — which is the lazy way to build
+    multi-timeframe fixtures — gives every timeframe identical indicator values,
+    so higher-timeframe confirmation becomes a tautology and the strategies
+    behave nothing like they would on real data.
+    """
+    out: list[Candle] = []
+    for start in range(0, len(candles) - factor + 1, factor):
+        group = candles[start : start + factor]
+        out.append(
+            Candle(
+                open_time=group[0].open_time,
+                open=group[0].open,
+                high=max(c.high for c in group),
+                low=min(c.low for c in group),
+                close=group[-1].close,
+                volume=sum(c.volume for c in group),
+                close_time=group[-1].close_time,
+                quote_volume=sum(c.quote_volume for c in group),
+                trades=sum(c.trades for c in group),
+                taker_buy_volume=sum(c.taker_buy_volume for c in group),
+                closed=True,
+            )
+        )
+    return out
+
+
+def multi_timeframe(
+    prices: list[float],
+    volumes: list[float] | None = None,
+    start_ms: int = 1_700_000_000_000,
+    wick: float = 0.001,
+    seed: int = 21,
+) -> dict[str, list[Candle]]:
+    """Build a realistic 1m/3m/5m/15m/1h set by resampling one 1-minute series.
+
+    Volume defaults to :func:`realistic_volumes` rather than a constant, for the
+    reasons documented there.
+    """
+    if volumes is None:
+        volumes = realistic_volumes(prices, seed=seed)
+    base = make_candles(prices, start_ms=start_ms, interval_ms=60_000, volumes=volumes, wick=wick)
+    return {
+        "1m": base,
+        "3m": resample(base, 3),
+        "5m": resample(base, 5),
+        "15m": resample(base, 15),
+        "1h": resample(base, 60),
+    }
+
+
 @pytest.fixture
 def candle_factory():
     return make_candles

@@ -263,6 +263,24 @@ class EdgeConfig(_Model):
     win_rate_prior: float = Field(0.45, gt=0, lt=1)
     win_rate_prior_weight: float = Field(40.0, ge=0)
 
+    # -- bootstrap ---------------------------------------------------------
+    # Without history the win probability shrinks to `win_rate_prior`, which at
+    # a reward:risk of 2.0 makes EVERY trade negative-edge. No trade passes, so
+    # no history accumulates: the system cannot bootstrap.
+    #
+    # In BACKTEST that circularity has to be broken, because measuring the win
+    # rate is the whole point of a backtest. When enabled, a strategy with
+    # insufficient evidence is ASSUMED to win at its break-even rate plus
+    # `bootstrap_win_rate_margin`, and every trade taken on that assumption is
+    # counted and reported separately.
+    #
+    # It must stay FALSE for live trading. Refusing to risk money on an
+    # unproven strategy is correct; live seeds its statistics from validated
+    # backtest results instead (EdgeCalculator.seed_from).
+    bootstrap_enabled: bool = False
+    bootstrap_win_rate_margin: float = Field(0.05, ge=0.0, le=0.5)
+    bootstrap_min_trades: int = Field(30, ge=0)
+
 
 class TradeConfig(_Model):
     max_duration_sec: int = Field(3600, ge=60, le=3600)
@@ -577,11 +595,27 @@ class AppConfig:
         return self.mode is TradingMode.LIVE
 
 
-def load_tunables(
-    config_file: str | Path, strategies_file: str | Path | None = None
-) -> TunableConfig:
-    """Read and validate the YAML tunables."""
-    path = Path(config_file)
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge ``override`` into ``base``, returning a new mapping.
+
+    Nested mappings merge key by key; anything else replaces wholesale. This is
+    what lets an overlay change one threshold without restating every section —
+    and, more importantly, without silently emptying the sections it omits. An
+    overlay that dropped ``regime.strategy_weights`` would leave no strategy
+    enabled in any regime, producing a backtest with zero trades that looked
+    like a strategy failure rather than a configuration one.
+    """
+    out = dict(base)
+    for key, value in override.items():
+        existing = out.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            out[key] = _deep_merge(existing, value)
+        else:
+            out[key] = value
+    return out
+
+
+def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise ConfigError("configuration file not found", path=str(path))
     try:
@@ -590,6 +624,27 @@ def load_tunables(
         raise ConfigError(f"configuration file is not valid YAML: {exc}", path=str(path)) from exc
     if not isinstance(raw, dict):
         raise ConfigError("configuration file must contain a mapping", path=str(path))
+    return raw
+
+
+def load_tunables(
+    config_file: str | Path, strategies_file: str | Path | None = None
+) -> TunableConfig:
+    """Read and validate the YAML tunables.
+
+    A file may declare ``extends: <path>`` (relative to its own directory) to
+    inherit from another config and override only the keys it names.
+    """
+    path = Path(config_file)
+    raw = _read_yaml(path)
+
+    parent = raw.pop("extends", None)
+    if parent:
+        resolved = (path.parent / str(parent)).resolve()
+        base = _read_yaml(resolved)
+        if base.pop("extends", None):
+            raise ConfigError("'extends' may only be one level deep", path=str(resolved))
+        raw = _deep_merge(base, raw)
 
     if strategies_file:
         spath = Path(strategies_file)
