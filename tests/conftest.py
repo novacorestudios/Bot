@@ -111,6 +111,34 @@ def trend_prices(
     return out
 
 
+def trending_with_pullbacks(
+    n: int,
+    start: float = 100.0,
+    drift: float = 0.0012,
+    pullback_every: int = 12,
+    pullback_bars: int = 4,
+    pullback_strength: float = 0.6,
+    noise: float = 0.0004,
+    seed: int = 3,
+) -> list[float]:
+    """A trend that RETRACES, which is what a real trend looks like.
+
+    ``trend_prices`` rises monotonically, which saturates RSI at 100 and leaves
+    price permanently extended from its moving averages — conditions the
+    momentum and trend strategies are specifically built to refuse. Any test
+    that wants those strategies to fire needs a path with pullbacks in it.
+    """
+    rng = random.Random(seed)
+    price = start
+    out: list[float] = []
+    for i in range(n):
+        in_pullback = (i % pullback_every) >= (pullback_every - pullback_bars)
+        step = -drift * pullback_strength if in_pullback else drift
+        price *= 1 + step + rng.gauss(0, noise)
+        out.append(price)
+    return out
+
+
 def ranging_prices(
     n: int, centre: float = 100.0, amplitude: float = 0.004, period: int = 20, seed: int = 11
 ) -> list[float]:
@@ -120,6 +148,60 @@ def ranging_prices(
         centre * (1 + amplitude * math.sin(2 * math.pi * i / period) + rng.gauss(0, amplitude / 12))
         for i in range(n)
     ]
+
+
+def impulse_prices(
+    n_base: int = 200,
+    direction: int = 1,
+    size: float = 0.0013,
+    seed: int = 3,
+    centre: float = 100.0,
+) -> list[float]:
+    """A consolidation followed by a realistic directional impulse.
+
+    The impulse contains counter-bars. That detail is not cosmetic: a run of
+    consecutive same-direction bars with no retracement drives Wilder RSI above
+    85 as a matter of arithmetic, and the momentum strategy is built to refuse
+    exactly that (its `rsi_long_max` ceiling). Real impulses retrace; a test
+    path without retracement tests nothing but the saturation guard.
+    """
+    prices = ranging_prices(n_base, centre=centre, amplitude=0.0015, period=25, seed=seed)
+    # up, up, pullback, up, up, pullback, up
+    for step in (1.0, 1.0, -0.45, 0.9, 1.0, -0.35, 0.8):
+        prices.append(prices[-1] * (1 + direction * size * step))
+    return prices
+
+
+def choppy_prices(
+    n: int,
+    centre: float = 100.0,
+    sigma: float = 0.0025,
+    reversion: float = 0.10,
+    seed: int = 17,
+    final_stretch: float = 0.0,
+) -> list[float]:
+    """A mean-reverting (Ornstein-Uhlenbeck) walk — a real ranging market.
+
+    A smooth sine wave is NOT a substitute: half a sine cycle is a dozen
+    consecutive same-direction bars, which reads as a strong trend to ADX (~28
+    in practice). Mean reversion and VWAP-fade both stand down above their ADX
+    ceiling, so a sine-based path can never exercise them.
+
+    ``final_stretch`` appends a sharp move away from the mean, producing the
+    stretched-but-not-trending condition those strategies exist to trade.
+    """
+    rng = random.Random(seed)
+    deviation = 0.0
+    out: list[float] = []
+    for _ in range(n):
+        deviation += -reversion * deviation + rng.gauss(0, sigma)
+        out.append(centre * (1 + deviation))
+    if final_stretch:
+        price = out[-1]
+        for step in (0.45, 0.3, 0.25):
+            price *= 1 + final_stretch * step
+            out.append(price)
+    return out
 
 
 def flat_prices(
