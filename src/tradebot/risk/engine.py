@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from tradebot.core.clock import SystemClock
 from tradebot.core.config import TunableConfig
 from tradebot.core.logging import get_logger
 from tradebot.core.mathutil import safe_div
@@ -55,6 +56,7 @@ from tradebot.risk.cooldown import CooldownManager
 from tradebot.risk.correlation import CorrelationEngine
 from tradebot.risk.killswitch import KillSwitchManager
 from tradebot.risk.portfolio import PortfolioState, PortfolioTracker
+from tradebot.risk.preservation import CapitalPreservation
 from tradebot.risk.sizing import PositionSizer
 from tradebot.signals.pipeline import Opportunity
 
@@ -77,6 +79,9 @@ class RiskContext:
     entries_blocked: bool = False
     entries_blocked_reason: str = ""
     in_flight: set[str] = field(default_factory=set)
+    #: Drawdown from peak equity, as a positive fraction. Drives the capital
+    #: preservation mode.
+    drawdown: float = 0.0
     now: float = field(default_factory=time.time)
 
 
@@ -98,6 +103,8 @@ class RiskEngine:
         self.kill_switches = KillSwitchManager(config.kill_switches, config.risk, clock)
         self.cooldowns = CooldownManager(config.cooldown, clock)
         self.allocator = StrategyAllocator(config.allocation)
+        self.preservation = CapitalPreservation(config.preservation, clock or SystemClock())
+        self._seen_day_rollovers = 0
         self.strategy_kill_switch = StrategyKillSwitch(
             config.strategy_kill_switch, self.allocator, clock
         )
@@ -139,6 +146,28 @@ class RiskEngine:
                 switches=[s.value for s in self.kill_switches.active],
             )
 
+        # -- 1b. capital preservation ---------------------------------------- #
+        # A HALTED day ends with the day. Nothing else releases HALTED: a
+        # drawdown that has partly recovered is not evidence its cause is gone.
+        if self.kill_switches.day_rollovers != self._seen_day_rollovers:
+            self._seen_day_rollovers = self.kill_switches.day_rollovers
+            self.preservation.reset("new trading day")
+
+        # Evaluated on every decision so a drawdown that opened mid-cycle is
+        # reflected immediately, not at the next heartbeat.
+        preservation = self.preservation.evaluate(
+            drawdown=context.drawdown,
+            daily_loss=max(0.0, -safe_div(context.realized_pnl_today, context.equity, 0.0)),
+            consecutive_losses=self.kill_switches.consecutive_losses,
+            equity=context.equity,
+        )
+        if self.config.preservation.enabled and not preservation.mode.allows_entries:
+            return self._reject(
+                RejectionReason.KILL_SWITCH_ACTIVE,
+                f"capital preservation is HALTED: {preservation.reason}",
+                preservation_mode=preservation.mode.value,
+            )
+
         # -- 2. entries blocked (reconciliation, safe mode) ------------------ #
         if context.entries_blocked:
             return self._reject(
@@ -162,13 +191,33 @@ class RiskEngine:
         # Checked here, before sizing and before the correlation matrix: it is
         # categorical and cheap, and reporting it directly is far more useful
         # than the correlation rejection a full book would otherwise produce.
-        if state.position_count >= self.config.risk.max_concurrent_positions:
+        max_positions = self.config.risk.max_concurrent_positions
+        if self.config.preservation.enabled:
+            max_positions = self.preservation.max_positions(max_positions)
+        if state.position_count >= max_positions:
             return self._reject(
                 RejectionReason.MAX_POSITIONS,
-                f"{state.position_count} positions already open "
-                f"(limit {self.config.risk.max_concurrent_positions})",
+                f"{state.position_count} positions already open (limit {max_positions}"
+                + (
+                    f", reduced by {preservation.mode.value} mode"
+                    if max_positions != self.config.risk.max_concurrent_positions
+                    else ""
+                )
+                + ")",
                 positions_open=state.position_count,
+                preservation_mode=preservation.mode.value,
             )
+
+        # -- 3c. a defensive mode raises the bar for what is worth taking ----- #
+        if self.config.preservation.enabled:
+            required = self.preservation.min_opportunity_score(self.config.opportunity.min_score)
+            if opportunity.opportunity_score.total < required:
+                return self._reject(
+                    RejectionReason.LOW_OPPORTUNITY_SCORE,
+                    f"score {opportunity.opportunity_score.total:.1f} is below the "
+                    f"{required:.1f} required in {preservation.mode.value} mode",
+                    preservation_mode=preservation.mode.value,
+                )
 
         # -- 4. cooldown ------------------------------------------------------ #
         cooldown = self.cooldowns.check(symbol, opportunity.strategy)
@@ -210,6 +259,10 @@ class RiskEngine:
             self.config.risk.risk_per_trade,
             list(self.allocator.performance) or [strategy],
         )
+        if self.config.preservation.enabled:
+            # Preservation scales the risk fraction; it never scales it up.
+            risk_fraction *= self.preservation.risk_multiplier
+
         remaining_budget = self.portfolio.remaining_risk_budget(state)
         if remaining_budget <= 0:
             return self._reject(
@@ -229,7 +282,11 @@ class RiskEngine:
             direction=direction,
             symbol_info=context.symbol_info,
             available_margin=min(
-                context.available_balance,
+                # The reserve is not idle money: it pays funding, fees and
+                # adverse margin moves on positions already open.
+                self.preservation.deployable(context.available_balance)
+                if self.config.preservation.enabled
+                else context.available_balance,
                 context.equity * self.config.risk.max_margin_usage - state.margin_used,
             ),
             volatility=opportunity.market.volatility,
@@ -433,6 +490,7 @@ class RiskEngine:
             "suspended_strategies": dict(self.suspended_strategies),
             "allocation": self.allocator.weights(list(self.allocator.performance)),
             "strategy_performance": self.allocator.report(),
+            "preservation": self.preservation.stats(),
         }
 
 

@@ -36,6 +36,7 @@ from tradebot.core.types import (
     Direction,
     ExitReason,
     MarketRegime,
+    RejectionReason,
     RiskEvent,
     Trade,
     TradingMode,
@@ -45,9 +46,11 @@ from tradebot.market.microstructure import CostModel, snapshot_from_book
 from tradebot.market.regime import RegimeDetector
 from tradebot.market.scanner import MarketScanner, enrich_candidates
 from tradebot.market.scoring import MarketScorer
+from tradebot.market.state import DataSource, MarketState
 from tradebot.market.universe import UniverseBuilder
 from tradebot.risk.engine import RiskContext, RiskEngine
 from tradebot.signals.pipeline import SignalPipeline
+from tradebot.signals.queue import OpportunityQueue
 from tradebot.strategies.base import MarketView
 from tradebot.strategies.registry import StrategyRegistry
 
@@ -64,10 +67,27 @@ class TradingEngine:
         self.events = EventBus()
 
         self.candles = CandleStore(self.tunables.timeframes.history_bars)
+        # Every consumer of market data reads through this object, and only
+        # through it. Both WebSocket and REST write into it, so "how old is my
+        # view of this symbol?" always has an answer (AUDIT_REPORT.md C-1).
+        self.market = MarketState(
+            self.candles,
+            stale_after_sec=self.tunables.stream.stale_after_sec,
+            lagging_after_sec=self.tunables.stream.lagging_after_sec,
+            clock=self.clock,
+        )
         self.cost_model = CostModel(self.tunables.edge)
         self.registry = StrategyRegistry.from_config(self.tunables)
         self.pipeline = SignalPipeline(self.tunables, self.registry, self.cost_model)
         self.risk = RiskEngine(self.tunables, self.candles, self.clock)
+        # Candidates are scored first and spent best-first, so a merely
+        # adequate opportunity high in the MARKET ranking cannot take the slot
+        # a better trade needed (AUDIT_REPORT.md M-7).
+        self.opportunities = OpportunityQueue(
+            ttl_sec=self.tunables.opportunity.queue_ttl_sec,
+            max_size=self.tunables.opportunity.queue_max_size,
+            clock=self.clock,
+        )
 
         self.gateway: Any = None
         self.execution: Any = None
@@ -76,6 +96,7 @@ class TradingEngine:
         self.repository: Any = None
         self.telegram: Any = None
         self.market_stream: Any = None
+        self.user_stream: Any = None
 
         from tradebot.app.health import HealthMonitor
 
@@ -92,8 +113,6 @@ class TradingEngine:
         self.realized_pnl_today = 0.0
         self.total_pnl = 0.0
         self.trades: list[Trade] = []
-        self.book_tickers: dict[str, Any] = {}
-        self.mark_prices: dict[str, Any] = {}
 
         self.started_at = time.time()
         self.running = False
@@ -101,6 +120,7 @@ class TradingEngine:
         self._shutdown = asyncio.Event()
         self._last_market_data = 0.0
         self._connected = True
+        self._reconcile_requested = asyncio.Event()
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -152,11 +172,14 @@ class TradingEngine:
             await self.repository.connect()
             self.health.beat("database")
         except Exception as exc:  # noqa: BLE001
+            self.repository.health.available = False
+            self.repository.health.last_error = str(exc)[:200]
             self.health.fail("database", str(exc)[:200])
             log.error(
                 "database_unavailable",
                 error=str(exc)[:200],
-                message="trading continues without an audit trail",
+                message="NEW ENTRIES ARE BLOCKED until the audit trail is "
+                "writable; exits and position management continue",
             )
 
         # -- notifications (never fatal) ------------------------------------ #
@@ -236,6 +259,9 @@ class TradingEngine:
         # -- reconcile BEFORE any entry is permitted ---------------------------- #
         await self.reconciler.startup()
 
+        # -- live data streams --------------------------------------------------- #
+        await self._start_streams(rest)
+
         # -- dashboard ---------------------------------------------------------- #
         if settings.dashboard_enabled:
             await self._start_dashboard()
@@ -248,6 +274,138 @@ class TradingEngine:
         )
         for name in ("market_data", "risk_engine", "execution"):
             self.health.beat(name)
+
+    async def _start_streams(self, rest: Any) -> None:
+        """Start the WebSocket feeds and make them the primary data path.
+
+        Before this, every component polled REST on the scan interval, so the
+        engine was acting on a picture of the market up to 15 seconds old — for
+        a scalper that is the difference between an edge and a loss. REST is now
+        the fallback and the reconciliation path, not the heartbeat.
+        """
+        stream_config = self.tunables.stream
+        if not stream_config.enabled:
+            log.warning(
+                "market_stream_disabled",
+                message="running on REST polling only; data will lag",
+            )
+            return
+
+        from tradebot.exchange.binance.ws import MarketStream, UserStream
+
+        ws_url = self.config.settings.ws_url
+        self.market_stream = MarketStream(
+            base_url=ws_url,
+            on_candle=self._on_stream_candle,
+            on_book=self._on_stream_book,
+            on_mark=self._on_stream_mark,
+            timeframes=self.tunables.timeframes.all(),
+            include_book=stream_config.include_book,
+            include_mark=stream_config.include_mark,
+            on_connect=self._on_market_stream_connected,
+            on_disconnect=self._on_market_stream_disconnected,
+        )
+        await self.market_stream.start()
+
+        # The user stream carries real fills. In paper mode the broker is the
+        # source of truth for fills, so there is nothing for it to deliver.
+        if stream_config.user_stream_enabled and self.config.mode is not TradingMode.PAPER:
+            self.user_stream = UserStream(
+                base_url=ws_url,
+                rest_client=rest,
+                on_event=self._on_user_event,
+                keepalive_interval=stream_config.keepalive_interval_sec,
+                on_connect=self._on_user_stream_connected,
+            )
+            await self.user_stream.start()
+
+        self.health.beat("market_data", "streams starting")
+
+    # ------------------------------------------------------------------ #
+    # Stream callbacks — the write side of MarketState
+    # ------------------------------------------------------------------ #
+    async def _on_stream_candle(self, symbol: str, timeframe: str, candle: Any) -> None:
+        self.market.apply_candle(symbol, timeframe, candle, DataSource.WEBSOCKET)
+        self._last_market_data = time.time()
+
+    async def _on_stream_book(self, book: Any) -> None:
+        self.market.apply_book(book, DataSource.WEBSOCKET)
+        self._last_market_data = time.time()
+
+    async def _on_stream_mark(self, mark: Any) -> None:
+        # The mark-price array stream carries every symbol on the exchange;
+        # keeping only what we follow stops the state growing without bound.
+        if mark.symbol in self.market.subscribed or (
+            self.execution is not None and mark.symbol in self.execution.positions
+        ):
+            self.market.apply_mark(mark, DataSource.WEBSOCKET)
+
+    def _apply_account_update(self, account: dict[str, Any]) -> None:
+        """Keep equity current between REST polls.
+
+        ACCOUNT_UPDATE carries wallet balance and per-position unrealised PnL,
+        which together are the equity. It does NOT carry available balance, so
+        that stays whatever the last REST poll said rather than being guessed:
+        available balance gates position sizing, and a wrong value there sizes
+        wrongly.
+        """
+        quote = self.tunables.account.quote_asset
+        wallet = next(
+            (b["wallet_balance"] for b in account.get("balances", []) if b["asset"] == quote),
+            None,
+        )
+        if wallet is None:
+            return
+        unrealized = sum(p["unrealized_pnl"] for p in account.get("positions", []))
+        self.equity = float(wallet) + float(unrealized)
+        self.peak_equity = max(self.peak_equity, self.equity)
+
+        # A position appearing or vanishing that we did not initiate means our
+        # local book and the exchange's disagree.
+        if account.get("positions"):
+            self._reconcile_requested.set()
+
+    async def _on_market_stream_connected(self) -> None:
+        self.market.set_stream_connected(True)
+        self.health.beat("market_data", "stream connected")
+        # A gap in the feed is a gap in our knowledge of our own orders, so a
+        # reconnect asks for reconciliation rather than assuming continuity.
+        self._reconcile_requested.set()
+
+    async def _on_market_stream_disconnected(self) -> None:
+        self.market.set_stream_connected(False)
+
+    async def _on_user_stream_connected(self) -> None:
+        self._reconcile_requested.set()
+
+    async def _on_user_event(self, event: str, data: Any) -> None:
+        """Route an authenticated user-stream event.
+
+        Order events are informational here; V2-5 gives them authority over the
+        order state machine. Account events refresh equity between REST polls.
+        """
+        from tradebot.exchange.binance import parsers
+
+        if event == "ORDER_TRADE_UPDATE":
+            update = parsers.parse_order_update(data)
+            if update is not None:
+                log.debug(
+                    "user_order_update",
+                    symbol=update.get("symbol"),
+                    status=update.get("status"),
+                    client_order_id=update.get("client_order_id"),
+                )
+                if self.execution is not None and hasattr(self.execution, "on_order_update"):
+                    await self.execution.on_order_update(update)
+        elif event == "ACCOUNT_UPDATE":
+            account = parsers.parse_account_update(data)
+            if account is not None:
+                self._apply_account_update(account)
+        elif event == "MARGIN_CALL":
+            log.critical(
+                "margin_call_received", data_keys=sorted(data) if isinstance(data, dict) else None
+            )
+            self.health.fail("execution", "margin call from exchange")
 
     async def _start_dashboard(self) -> None:
         import uvicorn
@@ -307,6 +465,8 @@ class TradingEngine:
             await asyncio.sleep(1.0)  # let the queue drain
             await self.telegram.stop()
 
+        if self.user_stream is not None:
+            await self.user_stream.stop()
         if self.market_stream is not None:
             await self.market_stream.stop()
         if self.repository is not None:
@@ -360,12 +520,64 @@ class TradingEngine:
         if self.repository is not None:
             self.repository.record_scan(result.candidates, result.timestamp)
 
-        self.book_tickers = await self.gateway.get_book_ticker()
-        with contextlib.suppress(Exception):
-            self.mark_prices = await self.gateway.get_mark_price()
+        # The subscribed set follows the ranking: candidates we might enter,
+        # plus everything we hold — a position must never lose its data feed
+        # because its symbol dropped out of the top 25.
+        follow = {c.symbol for c in result.candidates} | protected
+        await self._resubscribe(follow)
 
         # Retain candles for candidates plus anything we hold.
         self.candles.retain({c.symbol for c in result.candidates}, protected)
+
+        await self._rest_backfill()
+
+    async def _resubscribe(self, symbols: set[str]) -> None:
+        """Point the stream at the current symbol set."""
+        self.market.set_subscribed(symbols)
+        if self.market_stream is not None:
+            await self.market_stream.set_symbols(sorted(symbols))
+
+    async def _rest_backfill(self) -> None:
+        """Fill in over REST whatever the stream has not delivered.
+
+        Two cases are covered by the same call: the seconds after a
+        resubscription, before the first kline arrives for a newly ranked
+        symbol, and a symbol whose stream has genuinely gone quiet. Neither is
+        treated as an error — but both are recorded, because a rising fallback
+        count means the stream is not doing its job.
+        """
+        if not self.tunables.stream.rest_fallback_enabled:
+            return
+
+        stale = self.market.stale_symbols()
+        if not stale and self.market_stream is not None:
+            return
+
+        try:
+            books = await self.gateway.get_book_ticker()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("rest_book_fallback_failed", error=str(exc)[:200])
+            self.risk.record_api_error()
+            return
+
+        for symbol, book in books.items():
+            if symbol in self.market.subscribed:
+                self.market.apply_book(book, DataSource.REST)
+        for symbol in stale:
+            self.market.record_rest_fallback(symbol)
+
+        with contextlib.suppress(Exception):
+            for symbol, mark in (await self.gateway.get_mark_price()).items():
+                if symbol in self.market.subscribed:
+                    self.market.apply_mark(mark, DataSource.REST)
+
+        if stale:
+            log.warning(
+                "market_data_stale_symbols",
+                count=len(stale),
+                symbols=stale[:10],
+                message="backfilled over REST; entries stay blocked until live",
+            )
 
     async def _signal_loop(self) -> None:
         while self.running:
@@ -392,10 +604,28 @@ class TradingEngine:
             if series is None or series.is_empty:
                 continue
 
+            # Acting on stale data is how a scalper turns a spread into a loss:
+            # the price the decision was made at is no longer available. No
+            # entry may be opened on a symbol whose feed has gone quiet.
+            if not self.market.is_tradable(symbol):
+                reason = RejectionReason.STALE_DATA.value
+                self.pipeline.rejections[reason] = self.pipeline.rejections.get(reason, 0) + 1
+                if self.repository is not None:
+                    self.repository.record_decision(
+                        symbol,
+                        False,
+                        "market_data",
+                        f"data {self.market.age_sec(symbol):.0f}s old",
+                        self.clock.now_ms(),
+                        reason,
+                        {"freshness": self.market.freshness(symbol).value},
+                    )
+                continue
+
             regime_state = result.regimes.get(symbol)
             regime = regime_state.regime if regime_state else MarketRegime.SIDEWAYS
-            book = self.book_tickers.get(symbol)
-            mark = self.mark_prices.get(symbol)
+            book = self.market.book(symbol)
+            mark = self.market.mark(symbol)
             liquidity = snapshot_from_book(
                 symbol, book, quote_volume_24h=candidate.market_score.liquidity_usd
             )
@@ -448,10 +678,36 @@ class TradingEngine:
                 opportunity.expected_net_edge,
                 opportunity.opportunity_score.total,
             )
-            await self._attempt_trade(opportunity, pipeline_result.audit)
+            self.opportunities.add(opportunity, pipeline_result.audit)
 
         if best:
             self.scanner.last_result.candidates = enrich_candidates(result.candidates, best)
+
+        await self._spend_slots()
+
+    async def _spend_slots(self) -> None:
+        """Offer the best queued opportunities to the risk engine, best first.
+
+        Only as many as there are free position slots: asking risk to judge
+        twenty-five candidates when one slot is free wastes the cycle and, worse,
+        biases the outcome toward whichever symbol the scanner happened to rank
+        first. Zero free slots means zero offers — never a forced trade.
+        """
+        if self.execution is None:
+            return
+
+        configured = self.tunables.risk.max_concurrent_positions
+        allowed = (
+            self.risk.preservation.max_positions(configured)
+            if self.tunables.preservation.enabled
+            else configured
+        )
+        free = allowed - len(self.execution.positions) - len(self.execution.in_flight)
+        if free <= 0:
+            return
+
+        for entry in self.opportunities.take(free):
+            await self._attempt_trade(entry.opportunity, entry.audit)
 
     async def _attempt_trade(self, opportunity: Any, audit: dict[str, Any]) -> None:
         info = self.gateway.symbol_info(opportunity.symbol)
@@ -465,12 +721,13 @@ class TradingEngine:
             prices=self._prices(),
             symbol_info=info,
             realized_pnl_today=self.realized_pnl_today,
-            data_age_sec=time.time() - self._last_market_data if self._last_market_data else 0.0,
+            data_age_sec=self._data_age_sec(opportunity.symbol),
             connected=self._connected,
             entries_blocked=self.execution.entries_blocked or self.health.safe_mode,
             entries_blocked_reason=self.execution.entries_blocked_reason
             or self.health.safe_mode_reason,
             in_flight=self.execution.in_flight,
+            drawdown=self._drawdown(),
             now=time.time(),
         )
         decision = self.risk.evaluate(opportunity, context)
@@ -544,7 +801,7 @@ class TradingEngine:
             position = self.execution.positions.get(symbol)
             if position is None:
                 continue
-            price = self.candles.price(symbol) or position.entry_price
+            price = self.market.price(symbol) or position.entry_price
             if price <= 0:
                 continue
             position.update_extremes(price)
@@ -616,7 +873,14 @@ class TradingEngine:
     # ------------------------------------------------------------------ #
     async def _reconcile_loop(self) -> None:
         while self.running:
-            await asyncio.sleep(self.tunables.execution.reconcile_interval_sec)
+            # Wake early when a stream reconnect says our view may have a hole
+            # in it; otherwise run on the normal interval.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._reconcile_requested.wait(),
+                    timeout=self.tunables.execution.reconcile_interval_sec,
+                )
+            self._reconcile_requested.clear()
             try:
                 await self._refresh_account()
                 await self.reconciler.reconcile()
@@ -673,13 +937,19 @@ class TradingEngine:
         while self.running:
             await asyncio.sleep(self.tunables.health.heartbeat_interval_sec)
             try:
+                await self._check_database()
                 report = self.health.check()
-                if self.repository is not None:
-                    self.health.beat("database" if self.repository.health.available else "database")
-                    if not self.repository.health.available:
-                        self.health.degrade("database", self.repository.health.last_error or "")
 
-                stale = time.time() - self._last_market_data if self._last_market_data else 0.0
+                # The kill switch watches the FEED, not the scan loop: a scan
+                # that succeeds every five minutes says nothing about whether
+                # prices are still arriving.
+                stale = self.market.stream_age_sec()
+                if stale == float("inf"):
+                    stale = time.time() - self._last_market_data if self._last_market_data else 0.0
+                if self.market_stream is not None and self.market.stream_is_stale():
+                    self.health.degrade("market_data", f"no stream message for {stale:.0f}s")
+                else:
+                    self.health.beat("market_data")
                 switches = self.risk.kill_switches.evaluate(self.equity, stale, self._connected)
                 for switch in switches:
                     self.telegram.notify_kill_switch(switch.name.value, switch.reason, self.equity)
@@ -688,6 +958,33 @@ class TradingEngine:
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.error("health_loop_error", error=str(exc))
+
+    async def _check_database(self) -> None:
+        """Keep the health monitor's view of the database honest, and retry.
+
+        The audit trail is not optional bookkeeping: without it a trade cannot
+        be reconciled against the exchange or learned from afterwards. So a
+        failed database fails a CRITICAL component, which stops new entries —
+        while exits, trailing stops and the 60-minute cap keep running, because
+        refusing to close a position because a log write failed would be far
+        more dangerous than the missing row.
+        """
+        if self.repository is None:
+            return
+
+        if self.repository.health.available:
+            self.health.beat("database", f"{self.repository.health.writes} rows written")
+            return
+
+        recovered = await self.repository.reconnect(
+            self.tunables.health.database_reconnect_attempts,
+            self.tunables.health.database_reconnect_backoff_sec,
+        )
+        if recovered:
+            self.health.beat("database", "reconnected")
+            return
+
+        self.health.fail("database", self.repository.health.last_error or "unavailable")
 
     # ------------------------------------------------------------------ #
     # Event handlers
@@ -747,9 +1044,21 @@ class TradingEngine:
         if self.execution is None:
             return {}
         return {
-            symbol: self.candles.price(symbol) or position.entry_price
+            symbol: self.market.price(symbol) or position.entry_price
             for symbol, position in self.execution.positions.items()
         }
+
+    def _data_age_sec(self, symbol: str) -> float:
+        """Age of THIS symbol's data, not of the last scan.
+
+        The risk engine's staleness check used to see the scan-loop timestamp,
+        which is a global number: one dead symbol was invisible behind
+        twenty-four healthy ones.
+        """
+        age = self.market.age_sec(symbol)
+        if age == float("inf"):
+            return time.time() - self._last_market_data if self._last_market_data else 0.0
+        return age
 
     def _drawdown(self) -> float:
         if self.peak_equity <= 0:
@@ -795,10 +1104,14 @@ class TradingEngine:
             "safe_mode": self.health.safe_mode,
             "entries_allowed": (
                 self.risk.kill_switches.entries_allowed
+                and self.risk.preservation.entries_allowed
                 and not self.health.safe_mode
                 and not (self.execution.entries_blocked if self.execution else False)
             ),
             "uptime_sec": time.time() - self.started_at,
+            "market_data": self.market.stats(),
+            "preservation": self.risk.preservation.state.as_dict(),
+            "queued_opportunities": len(self.opportunities),
             "rejections": [
                 {"reason": reason, "count": count}
                 for reason, count in sorted(rejections.items(), key=lambda kv: -kv[1])[:12]
@@ -811,7 +1124,7 @@ class TradingEngine:
         now_ms = self.clock.now_ms()
         out = []
         for symbol, position in self.execution.positions.items():
-            price = self.candles.price(symbol) or position.entry_price
+            price = self.market.price(symbol) or position.entry_price
             out.append(
                 {
                     "symbol": symbol,
@@ -851,6 +1164,22 @@ class TradingEngine:
 
     def risk_view(self) -> dict[str, Any]:
         return self.risk.stats()
+
+    def queue_view(self) -> dict[str, Any]:
+        """What is waiting, in the order it will be offered to risk."""
+        return {"stats": self.opportunities.stats(), "queue": self.opportunities.report()}
+
+    def market_data_view(self) -> dict[str, Any]:
+        """Feed health: what is live, what is lagging, what is stale."""
+        return {
+            "state": self.market.stats(),
+            "symbols": self.market.symbol_report(),
+            "streams": [
+                stream.stats()
+                for stream in (self.market_stream, self.user_stream)
+                if stream is not None
+            ],
+        }
 
     async def recent_trades(self, limit: int = 50) -> list[dict[str, Any]]:
         if self.repository is not None:
@@ -909,7 +1238,7 @@ class _MarketAdapter:
         return await self._rest.get_mark_price(symbol)
 
     def price(self, symbol: str) -> float:
-        return self._engine.candles.price(symbol)
+        return self._engine.market.price(symbol)
 
     def book(self, symbol: str) -> Any:
-        return self._engine.book_tickers.get(symbol)
+        return self._engine.market.book(symbol)

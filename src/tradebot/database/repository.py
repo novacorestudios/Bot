@@ -70,6 +70,8 @@ class DatabaseHealth:
     buffered: int = 0
     last_error: str | None = None
     last_flush_ms: int = 0
+    reconnects: int = 0
+    reconnect_failures: int = 0
 
 
 class Repository:
@@ -111,7 +113,8 @@ class Repository:
             await connection.run_sync(Base.metadata.create_all)
 
         self._running = True
-        self._flush_task = asyncio.create_task(self._flush_loop(), name="db:flush")
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._flush_loop(), name="db:flush")
         self.health.available = True
         log.info("database_connected", url=_redact_url(self.database_url))
 
@@ -126,6 +129,47 @@ class Repository:
         if self._engine is not None:
             await self._engine.dispose()
             self._engine = None
+
+    async def reconnect(self, attempts: int = 3, backoff_sec: float = 5.0) -> bool:
+        """Try to reopen a failed connection.
+
+        Buffered rows survive: the deque is untouched, so once the database
+        comes back the audit trail continues rather than starting from the
+        outage. Returns True when the connection is usable again.
+        """
+        if self.health.available:
+            return True
+
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                if self._engine is not None:
+                    with contextlib.suppress(Exception):
+                        await self._engine.dispose()
+                    self._engine = None
+                await self.connect()
+            except Exception as exc:  # noqa: BLE001 - reconnection must not raise
+                self.health.reconnect_failures += 1
+                self.health.last_error = str(exc)[:200]
+                log.warning(
+                    "database_reconnect_failed",
+                    attempt=attempt,
+                    attempts=attempts,
+                    error=str(exc)[:200],
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(backoff_sec * attempt)
+                continue
+
+            self.health.reconnects += 1
+            log.info(
+                "database_reconnected",
+                attempt=attempt,
+                buffered=len(self._buffer),
+                message="buffered audit rows will be written on the next flush",
+            )
+            return True
+
+        return False
 
     # ------------------------------------------------------------------ #
     def _enqueue(self, record: Base) -> None:
@@ -511,6 +555,8 @@ class Repository:
     def stats(self) -> dict[str, Any]:
         return {
             "available": self.health.available,
+            "reconnects": self.health.reconnects,
+            "reconnect_failures": self.health.reconnect_failures,
             "writes": self.health.writes,
             "failures": self.health.failures,
             "dropped": self.health.dropped,

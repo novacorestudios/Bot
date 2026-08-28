@@ -46,6 +46,7 @@ from tradebot.core.types import (
     ExitReason,
     Order,
     OrderIntent,
+    OrderSide,
     OrderStatus,
     OrderType,
     Position,
@@ -54,6 +55,7 @@ from tradebot.core.types import (
     Trade,
     new_id,
 )
+from tradebot.execution.state import OrderState, OrderTracker
 
 log = get_logger(__name__)
 
@@ -92,6 +94,10 @@ class ExecutionEngine:
         self.positions: dict[str, Position] = {}
         self.orders: dict[str, Order] = {}
         self.trades: list[Trade] = []
+        # Every order's lifecycle, from before it is sent to a terminal state.
+        # The user stream, the REST response and reconciliation all write here,
+        # and the tracker is what makes their interleaving deterministic.
+        self.tracker = OrderTracker(self.clock)
 
         self._locks: dict[str, asyncio.Lock] = {}
         self._in_flight: set[str] = set()
@@ -162,11 +168,26 @@ class ExecutionEngine:
         except ExchangeError as exc:
             log.warning("set_leverage_failed", symbol=symbol, error=str(exc))
 
+        # Registered BEFORE the request leaves: if the process dies between
+        # here and the exchange acknowledging, the client order id still exists
+        # for reconciliation to look up.
+        tracked = self.tracker.create(
+            intent.client_order_id,
+            symbol,
+            intent.direction.name,
+            intent.quantity,
+            purpose="ENTRY",
+        )
+        self.tracker.transition(tracked.client_order_id, OrderState.SUBMITTED, "execution")
+
         self.submitted += 1
         try:
             order = await self.gateway.place_order(intent)
         except FilterViolationError as exc:
             self.rejected += 1
+            self.tracker.transition(
+                tracked.client_order_id, OrderState.FAILED, "execution", str(exc)[:120]
+            )
             await self._emit_risk_event(
                 RiskEventType.ORDER_REJECTED,
                 "WARNING",
@@ -179,6 +200,9 @@ class ExecutionEngine:
             # raised, we genuinely do not know the state — block entries and let
             # reconciliation settle it rather than guessing.
             self.block_entries(f"indeterminate order state for {symbol}")
+            self.tracker.transition(
+                tracked.client_order_id, OrderState.INDETERMINATE, "execution", str(exc)[:120]
+            )
             await self._emit_risk_event(
                 RiskEventType.RECONCILIATION_MISMATCH,
                 "CRITICAL",
@@ -189,6 +213,9 @@ class ExecutionEngine:
             return ExecutionResult.failure(f"indeterminate order state: {exc}")
         except ExchangeError as exc:
             self.rejected += 1
+            self.tracker.transition(
+                tracked.client_order_id, OrderState.REJECTED, "execution", str(exc)[:120]
+            )
             await self._emit_risk_event(
                 RiskEventType.ORDER_REJECTED,
                 "WARNING",
@@ -198,6 +225,7 @@ class ExecutionEngine:
             return ExecutionResult.failure(str(exc))
 
         self.orders[order.client_order_id] = order
+        self._sync_tracker(order, "rest_response")
 
         if order.status is OrderStatus.UNKNOWN:
             self.block_entries(f"unknown order state for {symbol}")
@@ -334,6 +362,7 @@ class ExecutionEngine:
             return False
 
         position.stop_order_id = stop_order.client_order_id
+        self._track_resting(stop_order, position, "STOP")
 
         # A take-profit is desirable but not mandatory: the position monitor can
         # close on target. A missing STOP is fatal; a missing target is not.
@@ -347,6 +376,7 @@ class ExecutionEngine:
                 client_order_id=f"tb_tp_{position.position_id[:12]}",
             )
             position.take_profit_order_id = target_order.client_order_id
+            self._track_resting(target_order, position, "TARGET")
         return True
 
     async def _emergency_close(
@@ -412,8 +442,18 @@ class ExecutionEngine:
 
         # Cancel resting protection first, so the close is not racing our own
         # stop order.
+        for resting in self.tracker.open_for(symbol):
+            if resting.purpose in {"STOP", "TARGET"}:
+                self.tracker.transition(
+                    resting.client_order_id, OrderState.CANCEL_REQUESTED, "execution", "closing"
+                )
         with contextlib.suppress(ExchangeError):
             await self.gateway.cancel_all_orders(symbol)
+        for resting in self.tracker.open_for(symbol):
+            if resting.purpose in {"STOP", "TARGET"}:
+                self.tracker.transition(
+                    resting.client_order_id, OrderState.CANCELLED, "execution", "closing"
+                )
 
         try:
             order = await self.gateway.close_position(
@@ -433,6 +473,12 @@ class ExecutionEngine:
                 symbol,
             )
             return None
+
+        self.tracker.create(
+            order.client_order_id, symbol, position.direction.name, position.quantity, "EXIT"
+        )
+        self.tracker.transition(order.client_order_id, OrderState.SUBMITTED, "execution")
+        self._sync_tracker(order, "rest_response")
 
         exit_price = order.average_price or position.entry_price
         trade = self._build_trade(position, order, exit_price, reason)
@@ -543,6 +589,110 @@ class ExecutionEngine:
             return True
 
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # Order state machine
+    # ------------------------------------------------------------------ #
+    def _track_resting(self, order: Order, position: Position, purpose: str) -> None:
+        """Register a resting protective order so its fill is not a surprise."""
+        self.tracker.create(
+            order.client_order_id,
+            position.symbol,
+            "SELL" if position.direction.sign > 0 else "BUY",
+            position.quantity,
+            purpose=purpose,
+        )
+        self.tracker.transition(order.client_order_id, OrderState.SUBMITTED, "execution")
+        self._sync_tracker(order, "rest_response")
+
+    def _sync_tracker(self, order: Order, source: str) -> None:
+        """Push a REST order response into the state machine."""
+        self.tracker.apply_exchange_update(
+            {
+                "client_order_id": order.client_order_id,
+                "exchange_order_id": order.exchange_order_id or "",
+                "status": order.status.value,
+                "filled_quantity": order.filled_quantity,
+                "average_price": order.average_price,
+                "commission": order.total_commission,
+            },
+            source,
+        )
+
+    async def on_order_update(self, update: dict[str, Any]) -> None:
+        """Apply a live ``ORDER_TRADE_UPDATE`` from the user data stream.
+
+        This is the difference between learning about a stop fill in
+        milliseconds and learning about it on the next reconciliation sweep,
+        with the position still counted as open in between — which is how a
+        flat account ends up refusing new trades on "max concurrent positions".
+        """
+        client_order_id = str(update.get("client_order_id") or "")
+        if not client_order_id or client_order_id not in self.tracker:
+            # Not ours: a manual order, or one from before a restart.
+            # Reconciliation owns that case; guessing here would be worse.
+            return
+
+        before = self.tracker.get(client_order_id)
+        purpose = before.purpose if before else "ENTRY"
+        self.tracker.apply_exchange_update(update, "user_stream")
+
+        after = self.tracker.get(client_order_id)
+        if after is None or after.state is not OrderState.FILLED:
+            return
+
+        symbol = str(update.get("symbol") or (before.symbol if before else ""))
+        if purpose in {"STOP", "TARGET"} and symbol in self.positions:
+            # A protective order filled: the exchange has already flattened us.
+            # Record the trade from the fill rather than sending another order.
+            await self._settle_protective_fill(symbol, purpose, after.average_price)
+
+    async def _settle_protective_fill(
+        self, symbol: str, purpose: str, exit_price: float
+    ) -> Trade | None:
+        """Book the trade for a stop or target that the exchange filled."""
+        async with self.lock_for(symbol):
+            position = self.positions.get(symbol)
+            if position is None:
+                return None
+
+            reason = ExitReason.STOP_LOSS if purpose == "STOP" else ExitReason.TAKE_PROFIT
+            price = exit_price or (
+                position.stop_loss if purpose == "STOP" else position.take_profit
+            )
+            settled = Order(
+                client_order_id=(
+                    position.stop_order_id if purpose == "STOP" else position.take_profit_order_id
+                )
+                or "",
+                symbol=symbol,
+                side=OrderSide.SELL if position.direction.sign > 0 else OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                quantity=position.quantity,
+                status=OrderStatus.FILLED,
+                filled_quantity=position.quantity,
+                average_price=price,
+                reduce_only=True,
+            )
+            trade = self._build_trade(position, settled, price, reason)
+            self.trades.append(trade)
+            self.positions.pop(symbol, None)
+
+            # The other side of the bracket is now dead; cancel it so it cannot
+            # open a position in the opposite direction.
+            with contextlib.suppress(ExchangeError):
+                await self.gateway.cancel_all_orders(symbol)
+
+            await self.events.emit(EventType.TRADE_COMPLETED, trade, source="execution")
+            log.info(
+                "protective_order_filled",
+                symbol=symbol,
+                purpose=purpose,
+                exit=price,
+                net_pnl=round(trade.net_pnl, 6),
+            )
+            return trade
+
+    # ------------------------------------------------------------------ #
     async def _emit_risk_event(
         self,
         event_type: RiskEventType,
@@ -576,6 +726,7 @@ class ExecutionEngine:
             "entries_blocked": self.entries_blocked,
             "entries_blocked_reason": self.entries_blocked_reason,
             "in_flight": sorted(self._in_flight),
+            "orders": self.tracker.stats(),
         }
 
 

@@ -132,7 +132,12 @@ class HealthMonitor:
             "execution": Component("execution", True, timeout),
             # Non-critical: their loss degrades observability, not safety.
             "user_stream": Component("user_stream", False, timeout * 2),
-            "database": Component("database", False, timeout * 3),
+            # Critical by default: the audit trail is what makes a trade
+            # reconstructable. Deployments that genuinely do not need it can
+            # set health.database_critical to false.
+            "database": Component(
+                "database", bool(getattr(config, "database_critical", True)), timeout * 3
+            ),
             "telegram": Component("telegram", False, timeout * 10),
             "dashboard": Component("dashboard", False, timeout * 10),
         }

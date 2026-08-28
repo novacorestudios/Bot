@@ -83,6 +83,7 @@ class KillSwitchManager:
         self._slippages: deque[tuple[float, float]] = deque(maxlen=50)
 
         self.consecutive_losses = 0
+        self.day_rollovers = 0
         self.reconciliation_mismatches = 0
         self.peak_equity = 0.0
         self.day_start_equity = 0.0
@@ -107,6 +108,7 @@ class KillSwitchManager:
 
         if day_index != self._day_index:
             self._day_index = day_index
+            self.day_rollovers += 1
             self.day_start_equity = equity
             self.consecutive_losses = 0
             # A new trading day clears the day-bound switches.

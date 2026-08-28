@@ -32,10 +32,11 @@ import aiohttp
 
 from tradebot.core.logging import get_logger
 from tradebot.core.types import BookTicker, Candle, MarkPriceInfo
+from tradebot.exchange.binance import parsers
 
 log = get_logger(__name__)
 
-MessageHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
+MessageHandler = Callable[[str, Any], Awaitable[None]]
 
 
 class _ReconnectingStream:
@@ -157,11 +158,11 @@ class _ReconnectingStream:
                     except json.JSONDecodeError:
                         log.warning("ws_bad_json", stream=self.name)
                         continue
-                    # Combined streams wrap the payload in {"stream":..,"data":..}
-                    if isinstance(payload, dict) and "data" in payload and "stream" in payload:
-                        await on_message(str(payload["stream"]), payload["data"])
-                    elif isinstance(payload, dict):
-                        await on_message(str(payload.get("e", "")), payload)
+                    # Unwrap the combined-stream envelope, then let the
+                    # handler decide — never assume a mapping here, because
+                    # array streams are legitimate payloads.
+                    stream_name, inner = parsers.unwrap(payload)
+                    await on_message(stream_name or parsers.event_type(inner), inner)
                 elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     log.warning("ws_closed_by_peer", stream=self.name, type=message.type.name)
                     break
@@ -204,6 +205,8 @@ class MarketStream(_ReconnectingStream):
         timeframes: tuple[str, ...] = ("1m",),
         include_book: bool = True,
         include_mark: bool = True,
+        on_connect: Callable[[], Awaitable[None]] | None = None,
+        on_disconnect: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         super().__init__("market")
         self.base_url = base_url.rstrip("/")
@@ -213,8 +216,12 @@ class MarketStream(_ReconnectingStream):
         self.timeframes = timeframes
         self.include_book = include_book
         self.include_mark = include_mark
+        # A reconnect is not merely a resubscribe: while the socket was down the
+        # exchange may have filled or cancelled orders we never saw, so the
+        # engine is told and reconciles (AUDIT_REPORT.md C-1).
+        self.on_connect = on_connect
+        self.on_disconnect = on_disconnect
         self._symbols: tuple[str, ...] = ()
-        self._resubscribe = asyncio.Event()
 
     def build_streams(self, symbols: tuple[str, ...]) -> list[str]:
         """Stream names for the requested symbols, per the official naming scheme."""
@@ -254,59 +261,43 @@ class MarketStream(_ReconnectingStream):
             return
         streams = self.build_streams(self._symbols)
         url = f"{self.base_url}/stream?streams={'/'.join(streams)}"
-        await self._consume(url, self._handle)
+        try:
+            await self._consume(url, self._handle, self.on_connect)
+        finally:
+            if self.on_disconnect is not None:
+                await self.on_disconnect()
 
-    async def _handle(self, stream: str, data: dict[str, Any]) -> None:
-        event = data.get("e", "")
+    async def _handle(self, stream: str, data: Any) -> None:
+        """Route one payload to its handler.
 
-        if event == "kline":
-            kline = data["k"]
-            candle = Candle(
-                open_time=int(kline["t"]),
-                open=float(kline["o"]),
-                high=float(kline["h"]),
-                low=float(kline["l"]),
-                close=float(kline["c"]),
-                volume=float(kline["v"]),
-                close_time=int(kline["T"]),
-                quote_volume=float(kline.get("q", 0) or 0),
-                trades=int(kline.get("n", 0) or 0),
-                taker_buy_volume=float(kline.get("V", 0) or 0),
-                closed=bool(kline.get("x", False)),
-            )
-            await self.on_candle(str(data["s"]), str(kline["i"]), candle)
+        ``data`` is deliberately typed ``Any``: ``!markPrice@arr@1s`` delivers a
+        JSON array, and assuming a mapping here is what caused AUDIT_REPORT.md
+        C-2. All shape handling lives in ``parsers``, which resolves it once.
+        """
+        kind = parsers.event_type(data)
+
+        if kind == "kline":
+            parsed = parsers.parse_kline(data)
+            if parsed is not None:
+                symbol, interval, candle = parsed
+                await self.on_candle(symbol, interval, candle)
             return
 
-        if event == "bookTicker" and self.on_book is not None:
-            await self.on_book(
-                BookTicker(
-                    symbol=str(data["s"]),
-                    bid_price=float(data["b"]),
-                    bid_qty=float(data["B"]),
-                    ask_price=float(data["a"]),
-                    ask_qty=float(data["A"]),
-                    timestamp=int(data.get("E", 0) or 0),
-                )
-            )
+        if kind == "bookTicker" and self.on_book is not None:
+            book = parsers.parse_book_ticker(data)
+            if book is not None:
+                await self.on_book(book)
             return
 
-        if event == "markPriceUpdate" and self.on_mark is not None:
-            await self.on_mark(
-                MarkPriceInfo(
-                    symbol=str(data["s"]),
-                    mark_price=float(data["p"]),
-                    index_price=float(data.get("i", 0) or 0),
-                    funding_rate=float(data.get("r", 0) or 0),
-                    next_funding_time=int(data.get("T", 0) or 0),
-                    timestamp=int(data.get("E", 0) or 0),
-                )
-            )
+        if kind == "markPriceUpdate" and self.on_mark is not None:
+            # Handles BOTH shapes: the single-symbol stream and the array
+            # stream, which is the one that used to crash.
+            for mark in parsers.parse_mark_price(data):
+                await self.on_mark(mark)
             return
 
-        # The mark-price array stream arrives as a list under one stream name.
-        if not event and isinstance(data, list) and self.on_mark is not None:
-            for entry in data:
-                await self._handle(stream, entry)
+        if kind:
+            log.debug("ws_unhandled_event", stream=stream, event=kind)
 
 
 class UserStream(_ReconnectingStream):
@@ -316,14 +307,16 @@ class UserStream(_ReconnectingStream):
         self,
         base_url: str,
         rest_client: Any,
-        on_event: Callable[[str, dict[str, Any]], Awaitable[None]],
+        on_event: Callable[[str, Any], Awaitable[None]],
         keepalive_interval: float = 1800.0,
+        on_connect: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         super().__init__("user")
         self.base_url = base_url.rstrip("/")
         self.rest = rest_client
         self.on_event = on_event
         self.keepalive_interval = keepalive_interval
+        self.on_connect = on_connect
         self._listen_key: str | None = None
         self._keepalive_task: asyncio.Task | None = None
 
@@ -362,10 +355,10 @@ class UserStream(_ReconnectingStream):
     async def _connect_once(self) -> None:
         self._listen_key = await self.rest.create_listen_key()
         url = f"{self.base_url}/ws/{self._listen_key}"
-        await self._consume(url, self._handle)
+        await self._consume(url, self._handle, self.on_connect)
 
-    async def _handle(self, event: str, data: dict[str, Any]) -> None:
-        kind = str(data.get("e", event))
+    async def _handle(self, event: str, data: Any) -> None:
+        kind = parsers.event_type(data) or event
         if kind == "listenKeyExpired":
             log.warning("listen_key_expired_reconnecting")
             self._listen_key = None

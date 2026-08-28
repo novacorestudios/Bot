@@ -67,6 +67,27 @@ kill_switches:
   # Automatic re-arm delay after a switch trips, seconds. 0 = manual only.
   auto_rearm_seconds: 900
 
+# Capital preservation. A 75 USDT account cannot absorb a bad day the way a
+# large one can: a 10% drawdown is 15 trades' worth of risk at 0.5%, and needs
+# an 11% gain to recover. Losing streaks therefore reduce size rather than
+# repeating it. NOTE: no mode ever blocks an EXIT.
+preservation:
+  enabled: true
+  # Drawdown from peak equity (fractions).
+  cautious_drawdown: 0.03
+  defensive_drawdown: 0.06
+  halt_drawdown: 0.10
+  # Realised loss within one trading day.
+  halt_daily_loss: 0.02
+  cautious_consecutive_losses: 3
+  defensive_consecutive_losses: 4
+  # Recovery must beat the threshold by this much before the mode relaxes.
+  recovery_hysteresis: 0.01
+  # And the mode must have been held at least this long.
+  min_mode_duration_sec: 900
+  # Equity never deployed, kept to pay funding, fees and adverse margin moves.
+  capital_reserve_fraction: 0.10
+
 cooldown:
   base_seconds: 120
   after_loss_seconds: 420
@@ -133,6 +154,22 @@ timeframes:
   # Bars retained in memory per symbol per timeframe.
   history_bars: 500
 
+# Live market data. The WebSocket feed is the primary data path; REST is the
+# fallback, the reconciliation path and the source of history.
+stream:
+  enabled: true
+  include_book: true
+  include_mark: true
+  # Older than this and the symbol is flagged, but still tradable.
+  lagging_after_sec: 10
+  # Older than this and NO new position may be opened on the symbol. Exits are
+  # deliberately still allowed: acting late is better than not acting.
+  stale_after_sec: 30
+  rest_fallback_enabled: true
+  user_stream_enabled: true
+  # Binance expires a listen key after 60 minutes; renew well inside that.
+  keepalive_interval_sec: 1800
+
 regime:
   adx_period: 14
   adx_strong_trend: 28.0
@@ -193,6 +230,11 @@ opportunity:
   penalties:
     cost: 25.0
     correlation: 20.0
+  # Opportunities are queued, ranked and spent best-first. An entry older than
+  # this is dropped rather than acted on: a signal from a 5m bar is not still
+  # valid ten minutes later.
+  queue_ttl_sec: 60
+  queue_max_size: 50
 
 edge:
   # Fee rates. Verify against your actual VIP tier and BNB-discount status.
@@ -346,6 +388,12 @@ health:
   component_timeout_sec: 60
   memory_warn_mb: 900
   cpu_warn_pct: 85.0
+  # A trade with no audit trail cannot be reconciled or learned from, so a
+  # failed database STOPS new entries. Exits and the management of open
+  # positions are never gated on it.
+  database_critical: true
+  database_reconnect_attempts: 3
+  database_reconnect_backoff_sec: 5
 
 ai:
   # Advisory only. Can never place, size or approve an order.

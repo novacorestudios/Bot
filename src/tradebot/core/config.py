@@ -165,6 +165,31 @@ class ScannerConfig(_Model):
         return self
 
 
+class StreamConfig(_Model):
+    """Live market data streaming.
+
+    ``stale_after_sec`` is the line between "my view of this symbol is current"
+    and "I must not open a position on it". It is deliberately generous
+    relative to the stream cadence: a 1m kline stream ticks continuously, so a
+    30-second silence means something is genuinely wrong, not merely quiet.
+    """
+
+    enabled: bool = True
+    include_book: bool = True
+    include_mark: bool = True
+    lagging_after_sec: float = Field(10.0, gt=0)
+    stale_after_sec: float = Field(30.0, gt=0)
+    rest_fallback_enabled: bool = True
+    user_stream_enabled: bool = True
+    keepalive_interval_sec: float = Field(1800.0, gt=0, le=3300)
+
+    @model_validator(mode="after")
+    def _ordering(self) -> StreamConfig:
+        if self.lagging_after_sec >= self.stale_after_sec:
+            raise ValueError("lagging_after_sec must be below stale_after_sec")
+        return self
+
+
 class TimeframeConfig(_Model):
     primary: str = "5m"
     fast: str = "1m"
@@ -248,6 +273,10 @@ class OpportunityConfig(_Model):
     moderate: float = Field(70.0, ge=0, le=100)
     weights: OpportunityWeights = OpportunityWeights()
     penalties: OpportunityPenalties = OpportunityPenalties()
+    #: How long a queued opportunity stays valid. A signal computed on a 5m bar
+    #: is not still valid ten minutes later.
+    queue_ttl_sec: float = Field(60.0, gt=0)
+    queue_max_size: int = Field(50, ge=1, le=500)
 
 
 class EdgeConfig(_Model):
@@ -433,11 +462,59 @@ class DatabaseConfig(_Model):
     prune_interval_sec: int = Field(3600, ge=60)
 
 
+class PreservationConfig(_Model):
+    """Capital preservation thresholds.
+
+    All values are positive fractions of equity. The thresholds must be ordered
+    cautious < defensive < halt, and the hysteresis band must be small enough
+    that recovering out of a mode is possible at all.
+    """
+
+    enabled: bool = True
+    cautious_drawdown: float = Field(0.03, gt=0, le=1)
+    defensive_drawdown: float = Field(0.06, gt=0, le=1)
+    halt_drawdown: float = Field(0.10, gt=0, le=1)
+    halt_daily_loss: float = Field(0.02, gt=0, le=1)
+    cautious_consecutive_losses: int = Field(3, ge=1)
+    defensive_consecutive_losses: int = Field(4, ge=1)
+    #: How far below a threshold the account must recover before the mode
+    #: relaxes. Without it, a drawdown sitting on a line flips modes every cycle.
+    recovery_hysteresis: float = Field(0.01, ge=0, le=1)
+    #: Minimum time in a mode before it may loosen. Escalation ignores it.
+    min_mode_duration_sec: float = Field(900.0, ge=0)
+    #: Equity held back from deployment, to pay funding, fees and adverse
+    #: margin moves on positions already open.
+    capital_reserve_fraction: float = Field(0.10, ge=0, lt=1)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> PreservationConfig:
+        if not self.cautious_drawdown < self.defensive_drawdown < self.halt_drawdown:
+            raise ValueError(
+                "preservation drawdown thresholds must increase: cautious < defensive < halt"
+            )
+        if self.cautious_consecutive_losses > self.defensive_consecutive_losses:
+            raise ValueError("cautious_consecutive_losses exceeds defensive_consecutive_losses")
+        if self.recovery_hysteresis >= self.cautious_drawdown:
+            raise ValueError(
+                "recovery_hysteresis is at or above cautious_drawdown, so the "
+                "engine could never relax out of CAUTIOUS"
+            )
+        return self
+
+
 class HealthConfig(_Model):
     heartbeat_interval_sec: float = Field(5.0, gt=0)
     component_timeout_sec: float = Field(60.0, gt=0)
     memory_warn_mb: float = Field(900.0, gt=0)
     cpu_warn_pct: float = Field(85.0, gt=0, le=100)
+    #: A trade with no audit trail cannot be reconstructed, reconciled or
+    #: learned from. When the database is down, NEW entries stop; exits and the
+    #: management of open positions are never gated on it.
+    database_critical: bool = True
+    #: Attempts to reopen a failed database connection before giving up on the
+    #: current cycle. Reconnection keeps retrying on later cycles regardless.
+    database_reconnect_attempts: int = Field(3, ge=0)
+    database_reconnect_backoff_sec: float = Field(5.0, gt=0)
 
 
 class AIConfig(_Model):
@@ -452,9 +529,11 @@ class TunableConfig(_Model):
     account: AccountConfig = AccountConfig()
     risk: RiskConfig = RiskConfig()
     kill_switches: KillSwitchConfig = KillSwitchConfig()
+    preservation: PreservationConfig = PreservationConfig()
     cooldown: CooldownConfig = CooldownConfig()
     scanner: ScannerConfig = ScannerConfig()
     timeframes: TimeframeConfig = TimeframeConfig()
+    stream: StreamConfig = StreamConfig()
     regime: RegimeConfig = RegimeConfig()
     aggregator: AggregatorConfig = AggregatorConfig()
     opportunity: OpportunityConfig = OpportunityConfig()

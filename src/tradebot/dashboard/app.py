@@ -100,6 +100,18 @@ def create_app(engine: Any, token: str = "") -> FastAPI:  # nosec B107
         authorise(request)
         return engine.risk_view()
 
+    @app.get("/api/queue")
+    async def queue(request: Request) -> dict[str, Any]:
+        """Opportunities waiting, best first."""
+        authorise(request)
+        return engine.queue_view()
+
+    @app.get("/api/market-data")
+    async def market_data(request: Request) -> dict[str, Any]:
+        """Feed health — which symbols are live, lagging or stale."""
+        authorise(request)
+        return engine.market_data_view()
+
     @app.get("/api/decisions")
     async def decisions(
         request: Request, limit: int = Query(100, ge=1, le=500), accepted: bool | None = None
