@@ -280,10 +280,19 @@ class DataStore:
         return {name: _symbol_from_dict(raw) for name, raw in payload.get("symbols", {}).items()}
 
     def manifests(self) -> list[DatasetManifest]:
-        """Every manifest under this root, for the run fingerprint."""
+        """Every manifest under this root, for the run fingerprint.
+
+        A manifest sits at ``<data file>.manifest.json``, so the data path is
+        recovered by stripping that exact suffix — not by juggling
+        ``with_suffix``, which for ``BTCUSDT.parquet.manifest.json`` produced a
+        path that existed nowhere and silently returned no manifests at all.
+        That left every run quoting the fingerprint of an empty set, which looks
+        like a valid hash and identifies nothing.
+        """
         found: list[DatasetManifest] = []
         for path in sorted(self.root.rglob("*.manifest.json")):
-            entry = read_manifest(path.with_suffix("").with_suffix(path.suffixes[-2]))
+            data_path = Path(str(path).removesuffix(".manifest.json"))
+            entry = read_manifest(data_path)
             if entry is not None:
                 found.append(entry)
         return found

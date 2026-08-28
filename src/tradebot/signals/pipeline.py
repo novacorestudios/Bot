@@ -57,10 +57,22 @@ class Opportunity:
 
     @property
     def strategy(self) -> str:
-        """The highest-confidence contributing strategy, for attribution."""
-        if not self.signal.contributing:
-            return "unknown"
-        return max(self.signal.contributing, key=lambda s: s.confidence).strategy
+        """The strategy this trade belongs to.
+
+        Delegates to `AggregatedSignal.primary_strategy` so that edge
+        statistics, risk allocation and trade ownership cannot disagree.
+        """
+        return self.signal.primary_strategy
+
+    @property
+    def contributing_strategies(self) -> tuple[str, ...]:
+        """Every strategy that agreed, primary first."""
+        return self.signal.contributing_strategies
+
+    @property
+    def contribution_weights(self) -> dict[str, float]:
+        """Each contributor's share of the agreeing confidence."""
+        return self.signal.contribution_weights
 
     @property
     def expected_net_edge(self) -> float:

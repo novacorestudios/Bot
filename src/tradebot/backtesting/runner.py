@@ -21,6 +21,7 @@ import json
 import shutil
 import subprocess  # nosec B404 - reads the local git commit, no user input
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from tradebot.backtesting.engine import BacktestData, BacktestEngine, BacktestResult
@@ -31,7 +32,50 @@ from tradebot.data.manifest import DatasetManifest, dataset_fingerprint, utc_now
 
 log = get_logger(__name__)
 
-CODE_VERSION = "v3"
+CODE_VERSION = "v3.1"
+
+
+class OOSMode(StrEnum):
+    """How the out-of-sample period is produced. The two are NOT equivalent.
+
+    ``LIVE_LIKE_FORWARD``
+        One continuous run. Cooldowns, strategy allocation and the edge
+        calculator's win-rate estimates keep adapting across the split, exactly
+        as they would live. Faithful to deployment — and **not a clean
+        holdout**, because the "out-of-sample" period is being traded by a
+        system that has already learned from the in-sample one.
+
+    ``STRICT_OOS``
+        The learned state is frozen at the split. The test period runs against
+        a configuration and a set of statistics that cannot see it. This is what
+        "out-of-sample" is normally taken to mean, and it is the harder test.
+
+    Calling the first one a holdout is the mistake this enum exists to prevent.
+    """
+
+    LIVE_LIKE_FORWARD = "LIVE_LIKE_FORWARD"
+    STRICT_OOS = "STRICT_OOS"
+
+
+class EdgeMode(StrEnum):
+    """Where the win probability behind the edge filter comes from.
+
+    ``LIVE_FAITHFUL``
+        Bootstrap enabled: an unproven strategy is *assumed* to win at
+        break-even plus a margin, so it can trade at all. This is what the live
+        system does, and it means the backtest partly measures the assumption.
+
+    ``RESEARCH_STRICT``
+        No assumed edge. Win probability comes only from evidence accumulated in
+        the training period, and is frozen for the test period. A strategy with
+        no training evidence simply does not trade.
+
+    A report must say which one produced it. Mixing them — training under one
+    and testing under the other — produces a number that means nothing.
+    """
+
+    LIVE_FAITHFUL = "LIVE_FAITHFUL"
+    RESEARCH_STRICT = "RESEARCH_STRICT"
 
 
 def git_commit() -> str:
@@ -80,6 +124,10 @@ class RunContext:
     dataset_fingerprint: str
     seed: int
     code_version: str = CODE_VERSION
+    oos_mode: str = OOSMode.LIVE_LIKE_FORWARD.value
+    edge_mode: str = EdgeMode.LIVE_FAITHFUL.value
+    universe_provenance: str = "PRESENT_DAY_UNIVERSE"
+    data_trust: str = "UNKNOWN"
     started_at: str = field(default_factory=utc_now_iso)
     symbols: list[str] = field(default_factory=list)
     intervals: list[str] = field(default_factory=list)
@@ -95,6 +143,10 @@ class RunContext:
             "dataset_fingerprint": self.dataset_fingerprint,
             "seed": self.seed,
             "code_version": self.code_version,
+            "oos_mode": self.oos_mode,
+            "edge_mode": self.edge_mode,
+            "universe_provenance": self.universe_provenance,
+            "data_trust": self.data_trust,
             "started_at": self.started_at,
             "symbols": list(self.symbols),
             "intervals": list(self.intervals),
@@ -111,6 +163,10 @@ class RunContext:
             f"  Dataset fingerprint {self.dataset_fingerprint[:16] or 'NONE'}",
             f"  Seed                {self.seed}",
             f"  Code version        {self.code_version}",
+            f"  OOS mode            {self.oos_mode}",
+            f"  Edge mode           {self.edge_mode}",
+            f"  Universe            {self.universe_provenance}",
+            f"  Data trust          {self.data_trust}",
             f"  Started             {self.started_at}",
         ]
 
@@ -212,6 +268,88 @@ class ScenarioResults:
             "scenarios": self.comparison(),
             "survives_stress": self.survives_stress,
         }
+
+
+@dataclass(slots=True)
+class SplitResults:
+    """A train period and a test period, run under a declared OOS mode."""
+
+    mode: OOSMode
+    split_ms: int
+    train: BacktestResult | None = None
+    test: BacktestResult | None = None
+    frozen_stats: dict[str, dict[str, float]] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode.value,
+            "split_ms": self.split_ms,
+            "train": self.train.metrics.as_dict() if self.train else None,
+            "test": self.test.metrics.as_dict() if self.test else None,
+            "frozen_strategies": sorted(self.frozen_stats),
+            "note": (
+                "learned state was frozen at the split; the test period could not adapt to itself"
+                if self.mode is OOSMode.STRICT_OOS
+                else "ONE CONTINUOUS ADAPTIVE RUN — this is NOT a clean holdout"
+            ),
+        }
+
+
+def run_strict_oos(
+    config: TunableConfig,
+    data: dict[str, BacktestData],
+    split_ms: int,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    seed: int = 0,
+    initial_capital: float | None = None,
+) -> SplitResults:
+    """Train, freeze, then test — a real holdout.
+
+    Two separate engines. The first runs to the split and accumulates whatever
+    the system learns: per-strategy win rates, allocation weights, cooldown
+    history. Those statistics are then **seeded into a fresh engine** which runs
+    only the test period.
+
+    The test engine keeps updating as it goes, exactly as a deployed system
+    would from that starting point — what it cannot do is have learned from the
+    test period *before* trading it, which is precisely what a single continuous
+    run lets happen.
+    """
+    train_engine = BacktestEngine(config, initial_capital)
+    train = train_engine.run(data, start_ms, split_ms, seed=seed)
+
+    frozen = train_engine.pipeline.edge_calculator.export_stats()
+
+    test_engine = BacktestEngine(config, initial_capital)
+    test_engine.pipeline.edge_calculator.seed_from(frozen)
+    test = test_engine.run(data, split_ms, end_ms, seed=seed)
+
+    log.info(
+        "strict_oos_complete",
+        split_ms=split_ms,
+        train_trades=train.metrics.total_trades,
+        test_trades=test.metrics.total_trades,
+        frozen_strategies=len(frozen),
+    )
+    return SplitResults(
+        mode=OOSMode.STRICT_OOS,
+        split_ms=split_ms,
+        train=train,
+        test=test,
+        frozen_stats=frozen,
+    )
+
+
+def split_continuous(split_ms: int) -> SplitResults:
+    """Label a split of ONE continuous adaptive run.
+
+    Reported as `LIVE_LIKE_FORWARD`, never as a holdout: the second half was
+    traded by a system that had already learned from the first. The trades
+    themselves are partitioned by the caller; what this carries is the honest
+    label, so a report cannot present the partition as a clean test.
+    """
+    return SplitResults(mode=OOSMode.LIVE_LIKE_FORWARD, split_ms=split_ms)
 
 
 def run_scenarios(

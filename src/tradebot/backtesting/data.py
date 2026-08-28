@@ -136,11 +136,17 @@ def load_dataset(
     Layout produced by ``scripts/download_data.py``::
 
         data/klines/<timeframe>/<SYMBOL>.parquet
-        data/klines/funding/<SYMBOL>.csv
+        data/funding/<SYMBOL>.parquet   (or .csv, legacy)
     """
-    root = Path(directory)
-    if not root.is_dir():
-        raise DataError("data directory not found", path=str(root))
+    dataset_root = Path(directory)
+    if not dataset_root.is_dir():
+        raise DataError("data directory not found", path=str(dataset_root))
+
+    # Two layouts are accepted, so `--data data` and `--data data/klines` both
+    # work and neither silently finds nothing:
+    #   <root>/klines/<interval>/<SYMBOL>.parquet   (DataStore, current)
+    #   <root>/<interval>/<SYMBOL>.parquet          (legacy)
+    root = dataset_root / "klines" if (dataset_root / "klines").is_dir() else dataset_root
 
     timeframes = timeframes or ["1m", "3m", "5m", "15m", "1h"]
     available = {p.name for p in root.iterdir() if p.is_dir()}
@@ -157,6 +163,19 @@ def load_dataset(
     unknown = set(chosen) - set(discovered)
     if unknown:
         raise DataError(f"symbols not present in the dataset: {sorted(unknown)}")
+
+    # Real exchange filters, if the acquisition pipeline stored them. Without
+    # these the loader invents PERMISSIVE placeholders (tick 1e-8, min notional
+    # 5.0), which lets a backtest take positions the exchange would reject —
+    # most often the small ones a 75 USDT account depends on.
+    resolved_infos = dict(symbol_infos or {})
+    if not resolved_infos:
+        from tradebot.data.store import DataStore
+
+        stored = DataStore(dataset_root)
+        resolved_infos = stored.load_exchange_info()
+        if resolved_infos:
+            log.info("exchange_info_loaded", symbols=len(resolved_infos))
 
     out: dict[str, BacktestData] = {}
     reports: list[DataQuality] = []
@@ -186,12 +205,12 @@ def load_dataset(
             log.warning("symbol_has_no_data", symbol=symbol)
             continue
 
-        info = (symbol_infos or {}).get(symbol) or _default_symbol_info(symbol)
+        info = resolved_infos.get(symbol) or _default_symbol_info(symbol)
         out[symbol] = BacktestData(
             symbol=symbol,
             candles=candles,
             symbol_info=info,
-            funding_rates=_load_funding(root, symbol),
+            funding_rates=_load_funding(dataset_root, symbol),
         )
 
     total_bars = sum(q.bars for q in reports)
@@ -206,20 +225,67 @@ def load_dataset(
     return out, reports
 
 
+#: Column pairs each supported funding layout uses, newest first.
+_FUNDING_COLUMNS = (
+    ("funding_time", "funding_rate"),  # DataStore.write_funding (current)
+    ("fundingTime", "fundingRate"),  # legacy CSV from the old download script
+    ("calc_time", "last_funding_rate"),  # the bulk archive's own header
+)
+
+
 def _load_funding(root: Path, symbol: str) -> dict[int, float]:
-    """Funding history keyed by funding timestamp, if it was downloaded."""
-    path = root / "funding" / f"{symbol}.csv"
-    if not path.is_file():
-        return {}
+    """Funding history keyed by the exchange's funding timestamp.
+
+    Reads Parquet first, because that is what :class:`DataStore` writes; CSV is
+    kept for datasets produced by the older download script.
+
+    This function used to look only for ``<SYMBOL>.csv`` with ``fundingTime`` /
+    ``fundingRate`` columns, while the store wrote ``<SYMBOL>.parquet`` with
+    ``funding_time`` / ``funding_rate``. Nothing raised — the mismatch simply
+    produced an empty mapping, so every backtest silently ran with **zero
+    funding**, which flatters any position held across a funding timestamp.
+    A missing file is legitimate; a file that exists and cannot be read is not,
+    so the two are logged differently.
+    """
     import pandas as pd
 
+    candidates = [root / "funding" / f"{symbol}{ext}" for ext in (".parquet", ".csv")]
+    path = next((p for p in candidates if p.is_file()), None)
+    if path is None:
+        return {}
+
     try:
-        frame = pd.read_csv(path)
-    except (OSError, ValueError):
+        frame = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
+    except (OSError, ValueError) as exc:
+        log.error(
+            "funding_file_unreadable",
+            path=str(path),
+            error=str(exc)[:200],
+            message="the backtest will run with NO funding costs",
+        )
         return {}
-    if "fundingTime" not in frame.columns or "fundingRate" not in frame.columns:
+
+    columns = set(frame.columns)
+    pair = next((c for c in _FUNDING_COLUMNS if set(c) <= columns), None)
+    if pair is None:
+        log.error(
+            "funding_file_has_no_recognised_columns",
+            path=str(path),
+            found=sorted(columns),
+            expected=[list(c) for c in _FUNDING_COLUMNS],
+            message="the backtest will run with NO funding costs",
+        )
         return {}
-    return {int(row.fundingTime): float(row.fundingRate) for row in frame.itertuples(index=False)}
+
+    time_column, rate_column = pair
+    out: dict[int, float] = {}
+    for row in frame.itertuples(index=False):
+        try:
+            out[int(getattr(row, time_column))] = float(getattr(row, rate_column))
+        except (TypeError, ValueError):
+            continue
+    log.info("funding_loaded", symbol=symbol, events=len(out), path=str(path))
+    return out
 
 
 def _default_symbol_info(symbol: str) -> SymbolInfo:

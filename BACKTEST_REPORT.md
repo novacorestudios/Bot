@@ -166,6 +166,31 @@ more code:
 
 ---
 
+## V3.1 correctness changes
+
+A source-level audit after V3 found fourteen further issues, all fixed and all
+regression-tested. Four mattered enough to change what a result would have meant:
+
+* **Funding was silently zero in every backtest** — the store wrote Parquet and
+  the loader read CSV. Any position held across a funding timestamp was
+  under-costed.
+* **Equity was marked at a price from before the position existed**, booking the
+  entry gap as instant PnL.
+* **Sharpe used a sampling interval 50x too long**, misstating it by roughly 7x.
+* **One trade could be attributed to two different strategies**, so every
+  per-strategy figure was quietly wrong.
+
+Plus: the documented CLI did not use the three-scenario runner; stored exchange
+filters were ignored in favour of permissive placeholders; funding was charged
+every 8 hours from entry rather than at the exchange's timestamps; and
+`strict=False` let damaged data produce a confident result.
+
+Full detail, with the regression test for each, in
+[`BACKTEST_AUDIT.md`](BACKTEST_AUDIT.md#v31-correctness-changes).
+
+**None of this changes the verdict below.** The measurement still has not been
+taken. What changed is that it would now be worth taking.
+
 ## Verdict
 
 Using the vocabulary of §42:

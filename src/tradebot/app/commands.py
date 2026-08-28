@@ -39,123 +39,188 @@ def _parse_date(text: str) -> int | None:
 
 
 async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:
-    """Run a historical backtest and report."""
+    """Run a historical backtest across all three execution scenarios.
+
+    This is the documented entry point, so it must exercise the real V3 path:
+    the scenario runner, the stored exchange filters and the data-trust gate.
+    Before V3.1 it called `BacktestEngine.run()` directly with `strict=False`
+    and no `symbol_infos`, which meant the documented command silently produced
+    a single-scenario run on placeholder filters and possibly damaged data.
+    """
     from tradebot.backtesting.data import load_dataset
-    from tradebot.backtesting.engine import BacktestEngine
-    from tradebot.backtesting.metrics import compute_metrics
+    from tradebot.backtesting.report import BacktestReport
+    from tradebot.backtesting.runner import (
+        EdgeMode,
+        OOSMode,
+        run_scenarios,
+        run_strict_oos,
+        split_continuous,
+    )
+    from tradebot.backtesting.trust import TrustLevel, evaluate_trust
+    from tradebot.data.store import DataStore
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    required = list(config.tunables.timeframes.all())
+
     try:
-        data, quality = load_dataset(
-            args.data,
-            symbols or None,
-            list(config.tunables.timeframes.all()),
-            strict=False,
-        )
+        data, quality = load_dataset(args.data, symbols or None, required, strict=False)
     except DataError as exc:
         print(f"DATA ERROR: {exc}")
         print("\nDownload history first:")
-        print("  python scripts/download_data.py --top 30 --start 2024-01-01")
+        print("  python scripts/fetch_data.py --top 30 --intervals 1m,3m,5m,15m,1h \\")
+        print("      --start 2024-01-01 --end 2025-01-01 --out data")
         return 1
 
     if not data:
         print(f"no usable data found in {args.data}")
         return 1
 
-    problems = [q for q in quality if q.problems]
-    if problems:
-        print(f"\nWARNING: {len(problems)} data-quality problems were found:")
-        for report in problems[:10]:
-            print(f"  {report.symbol} {report.timeframe}: {'; '.join(report.problems)}")
-        print("  A backtest on damaged data produces confident wrong numbers.\n")
+    # -- the trust gate: decided BEFORE the run, and it travels with it ----- #
+    store = DataStore(args.data)
+    exchange_info = store.load_exchange_info()
+    trust = evaluate_trust(
+        data=data,
+        quality=quality,
+        required_timeframes=required,
+        funding_enabled=config.tunables.backtest.apply_funding,
+        have_exchange_info=bool(exchange_info),
+        allow_degraded=bool(getattr(args, "allow_degraded", False)),
+    )
 
-    if config.tunables.edge.bootstrap_enabled:
-        print("\nNOTE: bootstrap mode is ON. Unproven strategies are assumed to")
-        print("win at break-even plus a margin, so this run measures what WOULD")
-        print("happen if that held — it is not evidence that it does.\n")
+    print("\n" + "=" * 68)
+    print("DATA TRUST")
+    print("=" * 68)
+    for line in trust.lines():
+        print(line)
+
+    if not trust.may_run:
+        print(
+            "\nREFUSED. These inputs cannot produce a result worth reading.\n"
+            "Fix the data, or pass --allow-degraded to inspect a run whose "
+            "output will be marked UNTRUSTED."
+        )
+        return 1
+
+    # -- edge mode: never mixed, always declared --------------------------- #
+    tunables = config.tunables
+    requested_edge_mode = getattr(args, "edge_mode", "") or ""
+    if requested_edge_mode == EdgeMode.RESEARCH_STRICT.value and tunables.edge.bootstrap_enabled:
+        tunables = tunables.model_copy(
+            update={"edge": tunables.edge.model_copy(update={"bootstrap_enabled": False})}
+        )
+        print(
+            "\nRESEARCH_STRICT: bootstrap disabled. A strategy with no measured\n"
+            "evidence will not trade, so this run cannot manufacture an edge."
+        )
+    elif (
+        requested_edge_mode == EdgeMode.LIVE_FAITHFUL.value and not tunables.edge.bootstrap_enabled
+    ):
+        print(
+            "\nNOTE: --edge-mode LIVE_FAITHFUL was requested but the config has\n"
+            "bootstrap disabled. Running RESEARCH_STRICT; the config wins."
+        )
+
+    if tunables.edge.bootstrap_enabled:
+        print("\nNOTE: bootstrap mode is ON (edge mode LIVE_FAITHFUL). Unproven")
+        print("strategies are assumed to win at break-even plus a margin, so this")
+        print("run measures what WOULD happen if that held — not that it does.")
 
     start_ms = _parse_date(args.start)
     end_ms = _parse_date(args.end)
+    seed = int(getattr(args, "seed", 42))
 
-    engine = BacktestEngine(config.tunables, config.tunables.account.initial_capital)
-    result = engine.run(data, start_ms, end_ms)
-    print(result.report())
+    # -- all three scenarios, never one ------------------------------------- #
+    manifests = store.manifests()
+    scenarios = run_scenarios(
+        tunables,
+        data,
+        start_ms,
+        end_ms,
+        seed=seed,
+        manifests=manifests,
+        initial_capital=tunables.account.initial_capital,
+    )
+    scenarios.context.data_trust = trust.level.value
+    scenarios.context.edge_mode = (
+        EdgeMode.LIVE_FAITHFUL.value
+        if tunables.edge.bootstrap_enabled
+        else EdgeMode.RESEARCH_STRICT.value
+    )
+    scenarios.context.universe_provenance = str(getattr(args, "universe", "PRESENT_DAY_UNIVERSE"))
 
-    payload: dict[str, Any] = {
-        "metrics": result.metrics.as_dict(),
-        "config": result.config_snapshot,
-        "rejections": result.rejections,
-        "bars_processed": result.bars_processed,
-        "bootstrap_estimates": result.bootstrap_estimates,
-        "bootstrap_strategies": list(result.bootstrap_strategies),
-        "strategy_stats": result.strategy_stats,
-        "symbols": sorted(data),
-        "trades": [
-            {
-                "symbol": t.symbol,
-                "strategy": t.strategy,
-                "direction": t.direction.value,
-                "entry": t.entry_price,
-                "exit": t.exit_price,
-                "net_pnl": t.net_pnl,
-                "fees": t.fees,
-                "funding": t.funding,
-                "duration_sec": t.duration_sec,
-                "exit_reason": t.exit_reason.value,
-                "regime": t.regime.value,
-                "opened_at": t.opened_at,
-                "closed_at": t.closed_at,
-            }
-            for t in result.trades
-        ],
-    }
+    print("\n" + "=" * 68)
+    print("RUN")
+    print("=" * 68)
+    for line in scenarios.context.lines():
+        print(line)
 
-    # -- out-of-sample split ------------------------------------------------ #
+    print("\n" + "=" * 68)
+    print("EXECUTION SCENARIOS")
+    print("=" * 68)
+    header = f"  {'scenario':<14}{'trades':>8}{'net PnL':>12}{'return %':>10}{'win':>8}{'maxDD':>8}"
+    print(header)
+    for row in scenarios.comparison():
+        print(
+            f"  {row['scenario']:<14}{row['trades']:>8}{row['net_pnl']:>12.4f}"
+            f"{row['return_pct']:>10.3f}{row['win_rate']:>8.3f}{row['max_drawdown']:>8.3f}"
+        )
+    print(f"\n  Survives STRESS: {scenarios.survives_stress}")
+
+    report = BacktestReport(scenarios)
+    payload: dict[str, Any] = report.as_dict()
+    payload["trust"] = trust.as_dict()
+
+    # -- out-of-sample ------------------------------------------------------ #
     split_ms = _parse_date(args.split) if args.split else None
-    if split_ms is not None:
-        in_sample = [t for t in result.trades if t.closed_at < split_ms]
-        out_sample = [t for t in result.trades if t.closed_at >= split_ms]
-        in_curve = [p for p in result.equity_curve if p.timestamp < split_ms]
-        out_curve = [p for p in result.equity_curve if p.timestamp >= split_ms]
+    if split_ms:
+        strict = bool(getattr(args, "strict_oos", False))
+        print("\n" + "=" * 68)
+        print(f"OUT-OF-SAMPLE — {'STRICT_OOS' if strict else 'LIVE_LIKE_FORWARD'}")
+        print("=" * 68)
 
-        print("\n" + "=" * 60)
-        print(f"IN-SAMPLE / OUT-OF-SAMPLE SPLIT AT {args.split}")
-        print("=" * 60)
-        for label, trades, points, capital in (
-            ("IN-SAMPLE", in_sample, in_curve, config.tunables.account.initial_capital),
-            (
-                "OUT-OF-SAMPLE",
-                out_sample,
-                out_curve,
-                in_curve[-1].equity if in_curve else config.tunables.account.initial_capital,
-            ),
-        ):
-            metrics = compute_metrics(trades, points, capital)
-            print(
-                f"\n{label}: {metrics.total_trades} trades, "
-                f"return {metrics.total_return * 100:+.2f}%, "
-                f"win rate {metrics.win_rate * 100:.1f}%, "
-                f"max drawdown {metrics.max_drawdown * 100:.1f}%"
+        if strict:
+            split = run_strict_oos(
+                tunables,
+                data,
+                split_ms,
+                start_ms,
+                end_ms,
+                seed=seed,
+                initial_capital=tunables.account.initial_capital,
             )
-            payload[label.lower().replace("-", "_")] = metrics.as_dict()
-
-        if out_sample:
-            out_metrics = compute_metrics(out_sample, out_curve, 1.0)
-            if out_metrics.total_return <= 0:
+            scenarios.context.oos_mode = OOSMode.STRICT_OOS.value
+            for label, part in (("TRAIN", split.train), ("TEST", split.test)):
+                if part is None:
+                    continue
+                metrics = part.metrics
                 print(
-                    "\n  OUT-OF-SAMPLE IS NEGATIVE. The in-sample result is not "
-                    "evidence of anything."
+                    f"  {label:<6} {metrics.total_trades:>5} trades  "
+                    f"return {metrics.total_return * 100:+7.2f}%  "
+                    f"win {metrics.win_rate * 100:5.1f}%  "
+                    f"maxDD {metrics.max_drawdown * 100:5.1f}%"
                 )
+            print(f"\n  {split.as_dict()['note']}")
+            if split.test and split.test.metrics.total_return <= 0:
+                print("\n  OUT-OF-SAMPLE IS NEGATIVE. The train result is not evidence.")
+            payload["out_of_sample"] = split.as_dict()
         else:
-            print("\n  No out-of-sample trades: the split proves nothing.")
+            print(
+                "  ONE CONTINUOUS ADAPTIVE RUN split at the date. The second half\n"
+                "  was traded by a system that had already learned from the first,\n"
+                "  so this is NOT a clean holdout. Use --strict-oos for that."
+            )
+            payload["out_of_sample"] = split_continuous(split_ms).as_dict()
 
-    # -- Monte Carlo -------------------------------------------------------- #
-    if len(result.trades) >= 30:
+    # -- Monte Carlo on the BASE scenario's real trades --------------------- #
+    from tradebot.backtesting.execution import Scenario
+
+    base = scenarios.results.get(Scenario.BASE)
+    if base and len(base.trades) >= 30:
         from tradebot.backtesting.montecarlo import MonteCarloAnalyzer
 
-        analyzer = MonteCarloAnalyzer(config.tunables.monte_carlo, seed=42)
+        analyzer = MonteCarloAnalyzer(config.tunables.monte_carlo, seed=seed)
         monte = analyzer.run(
-            result.trades,
+            base.trades,
             config.tunables.account.initial_capital,
             config.tunables.risk.max_drawdown,
         )
@@ -169,13 +234,20 @@ async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:
             "probability_of_ruin": monte.probability_of_ruin,
             "warnings": monte.warnings,
         }
-    elif result.trades:
+    elif base and base.trades:
         print(
-            f"\nMonte Carlo skipped: {len(result.trades)} trades is too few "
-            f"to resample meaningfully."
+            f"\nMonte Carlo skipped: {len(base.trades)} trades is too few to resample meaningfully."
         )
 
-    _write_report(args.report, payload)
+    if trust.level is not TrustLevel.TRUSTED:
+        print("\n" + "!" * 68)
+        print(trust.banner())
+        print("!" * 68)
+
+    path = Path(args.report)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, default=str))
+    print(f"\nreport written to {path}")
     return 0
 
 

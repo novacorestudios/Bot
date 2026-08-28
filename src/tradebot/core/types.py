@@ -493,6 +493,46 @@ class AggregatedSignal:
     def strategies(self) -> tuple[str, ...]:
         return tuple(s.strategy for s in self.contributing)
 
+    # ------------------------------------------------------------------ #
+    # Attribution. ONE definition, used by everything.
+    # ------------------------------------------------------------------ #
+    @property
+    def primary_strategy(self) -> str:
+        """The strategy this signal — and any trade from it — belongs to.
+
+        Highest confidence wins; ties break on the strategy name so the answer
+        cannot depend on tuple ordering. That determinism is the point: the edge
+        calculator previously took ``contributing[0]`` while the opportunity
+        took the highest-confidence one, so the *same trade* could be attributed
+        to two different strategies. Edge statistics, risk allocation and trade
+        ownership then referred to different things, and every per-strategy
+        report was quietly wrong.
+        """
+        if not self.contributing:
+            return "unknown"
+        return min(self.contributing, key=lambda s: (-s.confidence, s.strategy)).strategy
+
+    @property
+    def contributing_strategies(self) -> tuple[str, ...]:
+        """Every strategy that agreed, primary first."""
+        ordered = sorted(self.contributing, key=lambda s: (-s.confidence, s.strategy))
+        return tuple(s.strategy for s in ordered)
+
+    @property
+    def contribution_weights(self) -> dict[str, float]:
+        """Each contributor's share of the total agreeing confidence.
+
+        Lets a report separate "this strategy owned the trade" from "this
+        strategy supported it", which a single name cannot express.
+        """
+        total = sum(s.confidence for s in self.contributing)
+        if total <= 0:
+            return {}
+        return {
+            s.strategy: round(s.confidence / total, 6)
+            for s in sorted(self.contributing, key=lambda s: (-s.confidence, s.strategy))
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class CostEstimate:
@@ -777,13 +817,34 @@ class Trade:
     take_profit: float
     opened_at: int
     closed_at: int
+    #: PnL as actually filled: (exit_fill - entry_fill) x qty x sign. Execution
+    #: costs are already inside these prices, so subtracting them again from
+    #: this number double-counts. Use `reference_gross_pnl` for that.
     gross_pnl: float
     fees: float
     funding: float
     slippage_cost: float
     net_pnl: float
+
     exit_reason: ExitReason
     regime: MarketRegime
+
+    # -- the cost ledger (V3.1) ----------------------------------------- #
+    # One coherent accounting, so a report cannot double-count. The identity
+    # `cost_identity_error()` checks is:
+    #
+    #   reference_gross_pnl - execution_costs - fees - funding == net_pnl
+    #
+    # where execution_costs = spread + slippage + latency, both legs.
+    #: PnL had both legs filled at their reference prices — no spread, no
+    #: slippage, no latency. The pure price move the strategy was right about.
+    reference_gross_pnl: float = 0.0
+    entry_fee: float = 0.0
+    exit_fee: float = 0.0
+    spread_cost: float = 0.0
+    entry_slippage: float = 0.0
+    exit_slippage: float = 0.0
+    latency_cost: float = 0.0
     opportunity_score: float = 0.0
     expected_net_edge: float = 0.0
     consensus_score: float = 0.0
@@ -791,6 +852,28 @@ class Trade:
     initial_risk: float = 0.0
     reason_codes: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def execution_costs(self) -> float:
+        """Everything paid to the exchange's microstructure, both legs."""
+        return self.spread_cost + self.entry_slippage + self.exit_slippage + self.latency_cost
+
+    @property
+    def total_cost(self) -> float:
+        """Every cost of the round trip."""
+        return self.execution_costs + self.fees + self.funding
+
+    def cost_identity_error(self) -> float:
+        """How far the ledger is from balancing. Should be ~0.
+
+        A non-zero value means some cost is counted twice or not at all, and
+        every derived figure — expectancy, cost ratio, edge calibration — is
+        wrong by that amount.
+        """
+        if self.reference_gross_pnl == 0.0 and self.execution_costs == 0.0:
+            return 0.0  # ledger not populated (legacy trade)
+        expected = self.reference_gross_pnl - self.total_cost
+        return expected - self.net_pnl
 
     @property
     def duration_sec(self) -> float:

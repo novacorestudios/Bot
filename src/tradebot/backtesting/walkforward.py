@@ -1,17 +1,34 @@
-"""Walk-forward analysis.
+"""Rolling train/test evaluation ("walk-forward").
 
-A single backtest over one period proves almost nothing. Parameters chosen by
-looking at that period are fitted to it, and the result is a description of the
-past rather than a prediction. Walk-forward is the standard defence: repeatedly
-fit on a training window and evaluate on the *next*, unseen window.
+A single backtest over one period proves almost nothing. Walk-forward is the
+standard defence: repeatedly measure on a training window and evaluate on the
+*next*, unseen window.
 
-    |---- train ----|- val -|- test -|
-             |---- train ----|- val -|- test -|
-                      |---- train ----|- val -|- test -|
+    |---- train ----|-embargo-|- test -|
+             |---- train ----|-embargo-|- test -|
+                      |---- train ----|-embargo-|- test -|
 
-Only the **test** windows count. They are the only data the parameters have
-never seen, so their combined result is the closest thing to an honest estimate
-of forward performance.
+### What this is, precisely
+
+**This is a rolling train/test evaluation, not a 60/20/20 train/validation/test
+protocol.** The middle window is an **embargo gap**, not a validation set: it is
+reserved and skipped, never evaluated. Calling it "validation" would imply a
+model-selection step that does not exist here.
+
+The gap earns its place. Indicators look back hundreds of bars, so a test window
+starting immediately after training would be evaluated partly on indicator state
+computed from training data. The embargo removes that overlap.
+
+**No parameter optimisation is performed anywhere in this module.** Nothing is
+fitted, nothing is searched, nothing is selected. What "train" means here is
+only "the window whose results are used as the in-sample baseline for the
+efficiency ratio" — the strategies run with identical parameters in both
+windows. Automated search over a fixed dataset is precisely how overfitting
+happens, and the brief forbids it; parameter variants must be supplied
+explicitly by a caller who knows what they are doing.
+
+Only the **test** windows count as evidence. Their combined result is the
+closest thing to an honest estimate of forward performance.
 
 What makes a walk-forward result trustworthy is not a high average — it is
 **consistency**. A strategy that made all its money in one fold and lost in five
@@ -19,10 +36,7 @@ is a strategy that worked once. The efficiency ratio (out-of-sample return
 divided by in-sample return) measures how much of the fitted performance
 survived contact with unseen data; well below 1 means the fit was to noise.
 
-This module runs the folds and reports the distribution. It does NOT tune
-parameters automatically — automated search over a fixed dataset is precisely
-how overfitting happens, and the brief forbids adjusting live parameters without
-validation. Parameter variants must be supplied explicitly.
+This module runs the folds and reports the distribution.
 """
 
 from __future__ import annotations
@@ -49,8 +63,10 @@ class Fold:
     index: int
     train_start: int
     train_end: int
-    validation_start: int
-    validation_end: int
+    #: Reserved and NOT evaluated — an embargo gap that stops indicator
+    #: state computed on training bars leaking into the test window.
+    embargo_start: int
+    embargo_end: int
     test_start: int
     test_end: int
 
@@ -59,8 +75,9 @@ class Fold:
             "index": self.index,
             "train_start": self.train_start,
             "train_end": self.train_end,
-            "validation_start": self.validation_start,
-            "validation_end": self.validation_end,
+            "embargo_start": self.embargo_start,
+            "embargo_end": self.embargo_end,
+            "embargo_is_evaluated": False,
             "test_start": self.test_start,
             "test_end": self.test_end,
         }
@@ -161,28 +178,31 @@ class WalkForwardAnalyzer:
 
     # ------------------------------------------------------------------ #
     def build_folds(self, start_ms: int, end_ms: int) -> list[Fold]:
-        """Split the period into rolling train/validation/test windows."""
+        """Split the period into rolling train / embargo / test windows.
+
+        The embargo is skipped, not evaluated. See the module docstring.
+        """
         train_ms = self.walk.train_days * DAY_MS
-        validation_ms = self.walk.validation_days * DAY_MS
+        embargo_ms = self.walk.validation_days * DAY_MS
         test_ms = self.walk.test_days * DAY_MS
         step_ms = self.walk.step_days * DAY_MS
-        window_ms = train_ms + validation_ms + test_ms
+        window_ms = train_ms + embargo_ms + test_ms
 
         folds: list[Fold] = []
         cursor = start_ms
         index = 0
         while cursor + window_ms <= end_ms:
             train_end = cursor + train_ms
-            validation_end = train_end + validation_ms
+            embargo_end = train_end + embargo_ms
             folds.append(
                 Fold(
                     index=index,
                     train_start=cursor,
                     train_end=train_end,
-                    validation_start=train_end,
-                    validation_end=validation_end,
-                    test_start=validation_end,
-                    test_end=validation_end + test_ms,
+                    embargo_start=train_end,
+                    embargo_end=embargo_end,
+                    test_start=embargo_end,
+                    test_end=embargo_end + test_ms,
                 )
             )
             cursor += step_ms

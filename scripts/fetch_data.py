@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -80,7 +81,28 @@ async def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--symbols", default="", help="Comma-separated. Omit to use --top.")
-    parser.add_argument("--top", type=int, default=0, help="Most liquid N perpetuals.")
+    parser.add_argument(
+        "--symbols-file",
+        default="",
+        help="A point-in-time universe: one symbol per line, from a listing "
+        "snapshot taken at the START of the period. This is the only way to "
+        "avoid survivorship bias.",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=0,
+        help="Most liquid N perpetuals BY PRESENT-DAY VOLUME. Applying today's "
+        "ranking to a historical range is survivorship bias: symbols that were "
+        "liquid then and have since been delisted will not appear, and their "
+        "outcomes are silently excluded. Requires --i-understand-survivorship-bias.",
+    )
+    parser.add_argument(
+        "--i-understand-survivorship-bias",
+        action="store_true",
+        help="Required with --top. Acknowledges that the resulting dataset is a "
+        "PRESENT_DAY_UNIVERSE and any report from it must say so.",
+    )
     parser.add_argument("--intervals", default="5m,15m")
     parser.add_argument("--start", required=True, help="YYYY-MM-DD, UTC, inclusive")
     parser.add_argument("--end", default="", help="YYYY-MM-DD, UTC, exclusive. Default: now.")
@@ -99,6 +121,19 @@ async def main() -> int:
 
     intervals = [i.strip() for i in args.intervals.split(",") if i.strip()]
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    universe_provenance = "POINT_IN_TIME_UNIVERSE" if symbols else "UNKNOWN"
+
+    if args.symbols_file:
+        path = Path(args.symbols_file)
+        if not path.is_file():
+            raise SystemExit(f"--symbols-file not found: {path}")
+        symbols = [
+            line.strip().upper()
+            for line in path.read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        universe_provenance = "POINT_IN_TIME_UNIVERSE"
+        log.info("point_in_time_universe_loaded", count=len(symbols), path=str(path))
 
     settings = Settings()
     from tradebot.exchange.binance.rest import BinanceFuturesREST
@@ -124,11 +159,29 @@ async def main() -> int:
         if not symbols:
             if not args.top:
                 raise SystemExit("pass --symbols or --top")
+            if not args.i_understand_survivorship_bias:
+                print(
+                    "\n--top ranks by PRESENT-DAY volume and applies that ranking to a\n"
+                    "HISTORICAL range. Symbols that were liquid during the period but\n"
+                    "have since been delisted will not appear, and their outcomes — which\n"
+                    "are usually bad — are silently excluded from any result.\n\n"
+                    "This is survivorship bias. It can make a losing system look\n"
+                    "profitable, and no amount of care downstream removes it.\n\n"
+                    "  To proceed anyway:  --i-understand-survivorship-bias\n"
+                    "  To avoid it:        --symbols-file <listing snapshot from the\n"
+                    "                      START of the period>\n",
+                    file=sys.stderr,
+                )
+                await rest.close()
+                return 2
+
             symbols = await pick_symbols(rest, args.top, args.quote)
+            universe_provenance = "PRESENT_DAY_UNIVERSE"
             log.warning(
                 "symbols_chosen_by_present_day_liquidity",
                 count=len(symbols),
-                message="this is survivorship bias; see DATA_PIPELINE.md",
+                provenance=universe_provenance,
+                message="SURVIVORSHIP BIAS is present; any report must say so",
             )
 
         klines_source = VisionSource() if args.source == "archive" else RestSource(rest)
@@ -144,7 +197,28 @@ async def main() -> int:
     finally:
         await rest.close()
 
+    # Record the provenance beside the data, so a later report cannot claim a
+    # point-in-time universe it never had.
+    provenance_path = Path(args.out) / "symbols" / "universe_provenance.json"
+    provenance_path.parent.mkdir(parents=True, exist_ok=True)
+    provenance_path.write_text(
+        json.dumps(
+            {
+                "provenance": universe_provenance,
+                "symbols": symbols,
+                "selected_by": "--symbols-file"
+                if args.symbols_file
+                else ("--top (present-day volume)" if args.top else "--symbols"),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
     print(result.describe())
+    print(f"\n  Universe provenance: {universe_provenance}")
+    if universe_provenance == "PRESENT_DAY_UNIVERSE":
+        print("  WARNING: survivorship bias is present in this dataset.")
     if result.unusable:
         print("\nSome datasets are UNUSABLE. Fix or exclude them before backtesting.")
         return 1

@@ -225,7 +225,11 @@ class EdgeCalculator:
         gross_loss = safe_div(abs(entry - signal.stop_loss), entry, 0.0)
         reward_risk = safe_div(gross_win, gross_loss, 0.0)
 
-        name = strategy or (signal.contributing[0].strategy if signal.contributing else "unknown")
+        # ONE attribution model: AggregatedSignal.primary_strategy. Taking
+        # contributing[0] here made edge statistics refer to a different
+        # strategy than the one the trade was booked against whenever the
+        # aggregator's tuple order differed from confidence order.
+        name = strategy or signal.primary_strategy
         p = (
             win_probability
             if win_probability is not None

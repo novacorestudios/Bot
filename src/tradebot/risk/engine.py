@@ -390,6 +390,12 @@ class RiskEngine:
                 "risk_fraction": safe_div(sizing.risk_amount, context.equity, 0.0),
                 "correlation": assessment.portfolio_correlation,
                 "effective_positions": assessment.effective_positions,
+                # Attribution, recorded so a report can distinguish the trade's
+                # OWNER from the strategies that merely supported it. A single
+                # name cannot express a multi-strategy consensus.
+                "primary_strategy": signal.primary_strategy,
+                "contributing_strategies": list(signal.contributing_strategies),
+                "contribution_weights": signal.contribution_weights,
                 "strategies": list(signal.strategies),
                 "consensus_score": signal.consensus_score,
             },

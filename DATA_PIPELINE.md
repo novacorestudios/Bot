@@ -144,6 +144,19 @@ SYMBOL  INTERVAL  DATA_START  DATA_END  ROWS  MISSING  DUPLICATES  GAPS  COVERAG
 
 ### Survivorship bias
 
+**`--top` now refuses to run without `--i-understand-survivorship-bias`.**
+Ranking by present-day volume and applying it to a historical range excludes
+symbols that were liquid then and have since been delisted — whose outcomes are
+usually bad. It can make a losing system look profitable, and nothing downstream
+removes it.
+
+Use `--symbols-file` with a listing snapshot from the **start** of the period to
+avoid it. The provenance is written to `data/symbols/universe_provenance.json`
+and carried in every run context as `POINT_IN_TIME_UNIVERSE` or
+`PRESENT_DAY_UNIVERSE`, so a report cannot imply a clean universe it never had.
+
+### The original note
+
 `--top N` ranks symbols by **present-day** 24h volume and applies that ranking
 to a **historical** range. A symbol that was liquid during the period but has
 since been delisted will not appear, and its (often bad) outcome is silently
@@ -160,6 +173,14 @@ The parser records those as missing rather than failing, so a newly-listed
 symbol shows as `DEGRADED` with a large leading gap. That is the correct signal —
 but it means **coverage figures for newly listed symbols are not comparable** to
 those of symbols present throughout.
+
+### exchangeInfo is a present-day snapshot
+
+Tick size, step size, minimum quantity and minimum notional are fetched **now**
+and applied to a **historical** backtest. Binance changes these over time and
+publishes no historical filter endpoint, so a 2024 backtest runs under 2026's
+filters. Bounded, real, and unavoidable — stated so it is not mistaken for
+precision.
 
 ### Funding alignment
 

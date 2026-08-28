@@ -61,9 +61,36 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--symbols", default="", help="Comma-separated symbols (default: all)")
     bt.add_argument("--start", default="", help="ISO date, inclusive")
     bt.add_argument("--end", default="", help="ISO date, exclusive")
+    bt.add_argument("--split", default="", help="Split into train/test at this ISO date")
     bt.add_argument(
-        "--split", default="", help="Report in-sample/out-of-sample halves at this ISO date"
+        "--strict-oos",
+        action="store_true",
+        help="Freeze learned state at --split so the test period is a real "
+        "holdout. Without this the split is ONE continuous adaptive run and is "
+        "labelled LIVE_LIKE_FORWARD, not a clean holdout.",
     )
+    bt.add_argument(
+        "--allow-degraded",
+        action="store_true",
+        help="Run on data with gaps. The result is marked UNTRUSTED.",
+    )
+    bt.add_argument(
+        "--universe",
+        choices=["POINT_IN_TIME_UNIVERSE", "PRESENT_DAY_UNIVERSE"],
+        default="PRESENT_DAY_UNIVERSE",
+        help="How the symbol list was chosen. PRESENT_DAY means survivorship "
+        "bias is present; say so rather than letting a report imply otherwise.",
+    )
+    bt.add_argument(
+        "--edge-mode",
+        choices=["LIVE_FAITHFUL", "RESEARCH_STRICT"],
+        default="",
+        help="LIVE_FAITHFUL keeps bootstrap on, so unproven strategies trade on "
+        "an ASSUMED win rate — faithful to the live system, and partly a "
+        "measurement of the assumption. RESEARCH_STRICT turns it off: a strategy "
+        "with no evidence does not trade. Default: whatever the config says.",
+    )
+    bt.add_argument("--seed", type=int, default=42, help="Execution RNG seed")
     bt.add_argument("--report", default="reports/backtest.json")
 
     wf = sub.add_parser("walkforward", help="Run a walk-forward analysis")

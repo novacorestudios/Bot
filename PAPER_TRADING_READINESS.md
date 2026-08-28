@@ -52,6 +52,18 @@ The apparatus is built. The measurement has not been taken.
 
 ---
 
+## V3.1: the measurement is now trustworthy, the measurement still has not happened
+
+Fourteen correctness issues were found and fixed after V3 — funding silently
+zero, equity marked before the position existed, Sharpe off by ~7x, one trade
+attributable to two strategies, and the documented CLI not using the
+three-scenario runner. See
+[`BACKTEST_AUDIT.md`](BACKTEST_AUDIT.md#v31-correctness-changes).
+
+This changes nothing in the table above. Every row still fails for the same
+reason: **no data**. What V3.1 changes is that when the data arrives, the
+numbers it produces will mean what they say.
+
 ## What has to happen before paper trading
 
 In order. Each step gates the next.

@@ -314,3 +314,233 @@ claimed from this environment.**
 5. **B-9 to B-17** — correctness and reproducibility.
 
 Only then is a baseline run worth reading.
+
+---
+
+# V3.1 CORRECTNESS CHANGES
+
+A source-level audit after V3 found fourteen further issues. Every one was
+verified against the code before being fixed, and every fix has a regression
+test named for the defect it prevents. Tests live in
+`tests/integration/test_v31_correctness.py` unless stated otherwise.
+
+**None of these changes touches a strategy, a parameter or the trading thesis.**
+The correct outcome of V3.1 is CORRECTNESS VERIFIED, not PROFITABILITY VERIFIED.
+
+## P0
+
+### 1 — Funding was silently zero in every backtest
+
+**Problem.** `DataStore.write_funding()` wrote `data/funding/<SYMBOL>.parquet`
+with columns `funding_time` / `funding_rate`. `_load_funding()` read
+`data/funding/<SYMBOL>.csv` with columns `fundingTime` / `fundingRate`. Nothing
+raised — the mismatch produced an empty mapping, so **funding was zero in every
+run**, flattering any position held across a funding timestamp.
+
+**Fix.** The loader reads Parquet first and CSV as legacy, accepts all three
+known column layouts, and *logs an error* when a funding file exists but cannot
+be read — a missing file is legitimate, an unreadable one is not.
+
+**Test.** `TestIssue1FundingLoadsFromParquet` — writes funding through the real
+store, loads through the real loader, and asserts the rates survive. Would fail
+outright with the original code.
+
+### 2 — The documented CLI did not use the V3 scenario runner
+
+**Problem.** `tradebot backtest` called `BacktestEngine.run()` directly, so the
+documented command produced a **single-scenario** run. `run_scenarios()` existed
+and was tested in isolation, which proved nothing about what users actually ran.
+
+**Fix.** `run_backtest()` now calls `run_scenarios()` and prints BASE /
+CONSERVATIVE / STRESS side by side, with the full run context and the trust
+verdict.
+
+**Test.** `TestIssue2CLIUsesTheScenarioRunner` asserts the CLI function calls
+`run_scenarios` and no longer constructs a `BacktestEngine`.
+
+### 3 — Real exchange filters were stored and then ignored
+
+**Problem.** The acquisition pipeline saved `exchangeInfo`, but the CLI called
+`load_dataset()` without `symbol_infos`, so the loader fell back to permissive
+placeholders (tick `1e-8`, min notional 5.0). The backtest could take positions
+the exchange would reject — most often the small ones a 75 USDT account depends
+on.
+
+**Fix.** `load_dataset()` loads stored `exchangeInfo` automatically. Missing
+filters no longer pass silently: they downgrade the run to **UNTRUSTED**.
+
+**Note.** `exchangeInfo` is a *present-day metadata snapshot*. Binance changes
+tick sizes, step sizes and minimum notionals over time, and there is no
+historical filter endpoint — so filters applied to a 2024 backtest are 2026's.
+This is a bounded but real inaccuracy, and it is stated rather than hidden.
+
+**Test.** `TestIssue3RealExchangeInfo`.
+
+### 4 — Equity was marked at a price from before the position existed
+
+**Problem.** A signal is computed from bars closed at *T* and filled at the next
+bar's open. `_record_equity` marked open positions at `series.last_price` — the
+bar closed *before* the fill — so the entire open-to-previous-close gap was
+booked as instant PnL. On a 1% gap at 5x, that is 5% of margin appearing at the
+instant of entry, inflating the curve and understating the drawdown after it.
+
+**Fix.** A position opened in the current cycle is not marked at all; its honest
+mark-to-market is zero until a bar closes after it. A position is never marked
+against a bar that closed at or before its fill.
+
+**Test.** `TestIssue4EquityMarkingTiming`, parameterised over entries below, at
+and above the previous close.
+
+### 5 — Sharpe used a sampling interval 50x too long
+
+**Problem.** `_result()` passed `primary_timeframe x 50` to `compute_metrics()`,
+left over from when equity was sampled every 50 bars. Equity is now recorded
+every cycle. Sharpe and annualised volatility scale with the square root of
+samples per year, so a 50x error misstates Sharpe by about 7x.
+
+**Fix.** The interval is measured from the equity curve itself, using the
+**median** consecutive gap — a mean would be dragged by any data hole.
+
+**Test.** `TestIssue5SamplingInterval`, for 1m/5m/15m plus a month-long gap.
+
+### 6 — One trade could be attributed to two different strategies
+
+**Problem.** `EdgeCalculator` used `contributing[0].strategy` while
+`Opportunity.strategy` used the highest-confidence contributor. When the
+aggregator's tuple order differed from confidence order, **edge statistics, risk
+allocation and trade ownership referred to different strategies**, and every
+per-strategy report was quietly wrong.
+
+**Fix.** One model, on `AggregatedSignal`:
+`primary_strategy` (highest confidence, ties broken on name so ordering cannot
+change the answer), `contributing_strategies`, `contribution_weights`. Both call
+sites delegate to it, and the weights are recorded on the intent and the trade
+so a report can separate the trade's owner from its supporters.
+
+**Test.** `TestIssue6Attribution` — the same contributors in both tuple orders
+must attribute identically.
+
+## P1
+
+### 7 — Decisions ran only on the 5-minute timeline
+
+**Problem.** The live engine evaluates every 15 seconds; the backtest evaluated
+per 5m bar, so each decision point stood in for twenty live ones. Setups that
+appear and resolve inside one 5m bar were invisible, **systematically
+undercounting short-lived opportunities**.
+
+**Fix.** Decisions, fills, exits and marks run at the finest timeframe the
+dataset holds — normally 1m — while strategies keep reading their own closed
+3m/5m/15m/1h series. Nothing is interpolated.
+
+**Limitation, stated not hidden.** 15-second decisions **cannot** be
+reconstructed from 1m OHLCV: four sub-intervals of a minute are not recoverable
+from its open, high, low and close. 1m is a floor on the discrepancy, not a
+removal of it.
+
+**Test.** `TestIssue7DecisionCadence`.
+
+### 8 — A continuous adaptive run was presented as a holdout
+
+**Problem.** `--split` partitioned the trades of **one continuous run**, during
+which cooldowns, allocation and win-rate estimates kept adapting across the
+split. The "out-of-sample" half was traded by a system that had already learned
+from the in-sample half.
+
+**Fix.** Two explicitly labelled modes. `LIVE_LIKE_FORWARD` (the default) is the
+continuous run and now says in its own output that it is **not a clean holdout**.
+`--strict-oos` runs a train engine, freezes its learned statistics, seeds a
+fresh engine with them and runs only the test period.
+
+**Test.** `TestIssue8And12ModesAreDeclared`.
+
+### 9 — "Validation" was defined and never used
+
+**Problem.** `WalkForwardAnalyzer` computed a validation window and never
+evaluated it, while the module described a train/validation/test protocol.
+
+**Fix.** Option (B): renamed to **embargo** and documented as what it is — a
+reserved gap that stops indicator state computed on training bars leaking into
+the test window. The module now states plainly that **no parameter optimisation
+is performed anywhere in it**, and that this is a rolling train/test evaluation,
+not 60/20/20.
+
+**Test.** `TestIssue9WalkForwardHonesty`.
+
+### 10 — Costs could be double-counted
+
+**Problem.** `gross_pnl` is computed from *filled* prices, which already contain
+spread, slippage and latency. `slippage_cost` was also recorded as a separate
+field, so any report doing `gross - fees - funding - slippage` double-counted.
+
+**Fix.** An explicit ledger on `Trade`: `reference_gross_pnl` (both legs at
+their reference prices), `entry_fee`, `exit_fee`, `spread_cost`,
+`entry_slippage`, `exit_slippage`, `latency_cost`, `funding`. The identity
+
+```
+reference_gross_pnl - execution_costs - fees - funding == net_pnl
+```
+
+is checked on every close and logged as an error if it drifts.
+
+**Test.** `TestIssue10CostLedger`, including a deliberately unbalanced ledger to
+prove the check fires.
+
+### 11 — Funding was charged every 8 hours from entry
+
+**Problem.** `_apply_funding` charged on an interval measured from the position's
+own open time, not at the exchange's published timestamps. A position opened at
+07:59 was charged for 08:00 only at 15:59; one opened at 00:01 was charged for an
+event it had missed. Both wrong, in opposite directions, neither visible.
+
+**Fix.** Funding is charged for exactly the events whose timestamps fall strictly
+inside the position's life. Opened exactly at an event: not charged, because the
+exchange's snapshot did not include it.
+
+**Test.** `TestIssue11FundingUsesRealEvents` — just before, exactly at and just
+after an event; long and short; multiple events; and a double-sweep to prove no
+event is charged twice.
+
+## P2
+
+### 12 — Research mode
+
+**Problem.** The bootstrap assumes an unproven strategy wins at break-even plus
+a margin. That is faithful to the live system, and it means a backtest partly
+measures the assumption.
+
+**Fix.** `--edge-mode RESEARCH_STRICT` disables it: a strategy with no measured
+evidence does not trade. The mode is recorded in the run context, so a report
+always states whether it is `LIVE_FAITHFUL` or `RESEARCH_STRICT`.
+
+### 13 — Survivorship bias was a log line
+
+**Problem.** `--top` ranks by present-day volume and applies that ranking to a
+historical range.
+
+**Fix.** `--top` now **refuses to run** without
+`--i-understand-survivorship-bias`, and prints what the bias does. `--symbols-file`
+accepts a point-in-time listing snapshot. The provenance is written beside the
+data and carried in the run context as `POINT_IN_TIME_UNIVERSE` or
+`PRESENT_DAY_UNIVERSE`.
+
+### 14 — `strict=False` turned damaged data into a trusted result
+
+**Problem.** The CLI loaded with `strict=False` and printed a warning. Nothing
+stopped a confident number being produced from damaged data.
+
+**Fix.** `backtesting/trust.py` decides before the run and the verdict travels
+with it. Damaged data and missing timeframes are **REFUSED**; missing
+`exchangeInfo` or funding **downgrade to UNTRUSTED**; gaps require an explicit
+`--allow-degraded` and force UNTRUSTED. Every report from a non-trusted run
+carries a banner saying the numbers are not evidence.
+
+**Test.** `TestIssue14DataQualityGate`.
+
+## Also fixed while verifying
+
+`DataStore.manifests()` derived the data path from the manifest path with a
+`with_suffix` chain that produced a path existing nowhere, so it always returned
+an empty list — and **every run quoted the fingerprint of an empty set**, which
+looks like a valid hash and identifies nothing. Now strips the `.manifest.json`
+suffix directly.

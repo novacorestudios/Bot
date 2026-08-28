@@ -48,6 +48,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 from tradebot.backtesting.execution import (
     CostBreakdown,
     ExecutionAssumptions,
@@ -67,6 +69,7 @@ from tradebot.core.types import (
     OrderIntent,
     Position,
     SymbolInfo,
+    Timeframe,
     Trade,
     new_id,
 )
@@ -216,6 +219,8 @@ class BacktestEngine:
         #: Symbols whose dataset lacks a timeframe the strategies need. A
         #: non-empty mapping means "few trades" is a data problem, not a result.
         self.missing_timeframes: dict[str, list[str]] = {}
+        #: The timeframe decisions were actually evaluated on.
+        self.decision_interval: str = config.timeframes.primary
 
     # ------------------------------------------------------------------ #
     def run(
@@ -234,7 +239,10 @@ class BacktestEngine:
         before V3 — meant alphabetical order decided who got the last free slot.
         """
         started = time.time()
-        primary = self.config.timeframes.primary
+        # Decisions run at the finest resolution the data holds; the strategies
+        # still read their own closed series. See decision_timeframe().
+        primary = self.decision_timeframe(data)
+        self.decision_interval = primary
 
         self.simulator = ExecutionSimulator(
             assumptions
@@ -267,6 +275,8 @@ class BacktestEngine:
             initial_capital=self.initial_capital,
             scenario=self.simulator.assumptions.name.value,
             seed=seed,
+            decision_timeframe=primary,
+            strategy_primary=self.config.timeframes.primary,
         )
 
         for index, (timestamp, symbols) in enumerate(cycles):
@@ -337,14 +347,48 @@ class BacktestEngine:
         self.missing_timeframes = missing
 
     # ------------------------------------------------------------------ #
+    def decision_timeframe(self, data: dict[str, BacktestData]) -> str:
+        """The finest timeframe present, which is how often decisions are made.
+
+        The live engine evaluates every ``signal_interval_sec`` — 15 seconds by
+        default. Driving the backtest off the 5-minute primary instead means
+        each decision point stands in for twenty live ones, which
+        **systematically undercounts short-lived opportunities**: a setup that
+        appears and resolves inside one 5m bar is invisible.
+
+        So decisions run at the finest resolution the dataset actually holds,
+        normally 1m, while the strategies keep reading properly closed 3m/5m/
+        15m/1h series. Nothing is interpolated and no bar is invented.
+
+        **15-second decisions cannot be reconstructed from 1m OHLCV.** Four
+        sub-intervals of a minute are not recoverable from its open, high, low
+        and close, and pretending otherwise would be fabricating data. 1m is
+        therefore a floor on the discrepancy, not a removal of it.
+        """
+        present = {tf for entry in data.values() for tf, bars in entry.candles.items() if bars}
+        candidates = [tf for tf in self.config.timeframes.all() if tf in present]
+        if not candidates:
+            return self.config.timeframes.primary
+
+        def seconds(timeframe: str) -> int:
+            try:
+                return Timeframe(timeframe).seconds
+            except ValueError:
+                return 10**9
+
+        return min(candidates, key=seconds)
+
     def _build_timeline(
         self, data: dict[str, BacktestData], primary: str, start_ms: int | None, end_ms: int | None
     ) -> list[tuple[int, list[str]]]:
-        """Bars grouped by timestamp, chronologically.
+        """Decision points grouped by timestamp, chronologically.
 
         Grouping is what makes cross-symbol ranking possible at all: at a given
-        moment the engine must be able to see every symbol that printed a bar,
-        rank them, and only then decide.
+        moment the engine must see every symbol that printed a bar, rank them,
+        and only then decide.
+
+        ``primary`` here is the DECISION timeframe, not the strategies' primary
+        series — see :meth:`decision_timeframe`.
         """
         grouped: dict[int, list[str]] = {}
         for symbol, entry in data.items():
@@ -578,7 +622,7 @@ class BacktestEngine:
         if quantity <= 0:
             return
 
-        series = self.candles.get(intent.symbol, self.config.timeframes.primary)
+        series = self.candles.get(intent.symbol, self.decision_interval)
         bar = series.last if series else None
         liquidity = self._liquidity(data, fill_price)
 
@@ -652,6 +696,12 @@ class BacktestEngine:
             metadata={
                 "volatility": volatility,
                 "consensus_score": intent.metadata.get("consensus_score", 0.0),
+                "entry_reference_price": fill_price,
+                "entry_spread_cost": fill.spread_cost,
+                "entry_latency_cost": fill.latency_cost,
+                "primary_strategy": intent.metadata.get("primary_strategy", intent.strategy),
+                "contributing_strategies": intent.metadata.get("contributing_strategies", []),
+                "contribution_weights": intent.metadata.get("contribution_weights", {}),
             },
         )
         self.positions[intent.symbol] = position
@@ -663,7 +713,7 @@ class BacktestEngine:
             entry = data.get(symbol)
             if entry is None:
                 continue
-            series = self.candles.get(symbol, self.config.timeframes.primary)
+            series = self.candles.get(symbol, self.decision_interval)
             bar = series.last if series else None
             if bar is None:
                 continue
@@ -777,20 +827,57 @@ class BacktestEngine:
                 position.trailing_active = True
 
     def _apply_funding(self, position: Position, data: BacktestData, timestamp: int) -> None:
-        """Charge funding when the position crosses a funding timestamp."""
-        if not self.config.backtest.apply_funding:
+        """Charge every ACTUAL funding event the position has lived through.
+
+        Not "every eight hours since entry", which is what this did before.
+        That model charges a position opened at 07:59 as if it had paid the
+        08:00 event only at 15:59, and charges one opened at 00:01 for an event
+        it missed — both wrong, in opposite directions, and neither visible in
+        the output.
+
+        The exchange charges at its own published timestamps. A position pays an
+        event if and only if it was open when that timestamp passed:
+
+            entry ─────┬──────────┬───────── exit
+                    08:00      16:00          <- both charged
+            entry ──────────────────┬──────── exit
+                                 16:00        <- only this one
+
+        Rate sign follows the direction: a long pays positive funding, a short
+        receives it.
+        """
+        if not self.config.backtest.apply_funding or not data.funding_rates:
             return
-        interval_ms = self.config.edge.funding_interval_hours * 3_600_000
-        last_charge = position.metadata.get("last_funding_ms", position.opened_at)
-        if timestamp - last_charge < interval_ms:
+
+        last_charged = int(position.metadata.get("last_funding_ms", position.opened_at))
+        # Events strictly after what we have already charged, up to now. Strict
+        # on the lower bound so an event exactly at entry is not charged — the
+        # position did not exist when the exchange took its snapshot.
+        due = [
+            (event_ms, rate)
+            for event_ms, rate in data.funding_rates.items()
+            if last_charged < event_ms <= timestamp and event_ms > position.opened_at
+        ]
+        if not due:
             return
-        rate = self._funding_rate(data, timestamp)
-        if rate:
+
+        for event_ms, rate in sorted(due):
+            if not rate:
+                continue
             notional = position.quantity * position.entry_price
             payment = notional * rate * position.direction.sign
             position.funding_paid += payment
             self.balance -= payment
-        position.metadata["last_funding_ms"] = timestamp
+            self.cost_breakdown.funding += payment
+            log.debug(
+                "funding_charged",
+                symbol=position.symbol,
+                at_ms=event_ms,
+                rate=rate,
+                payment=round(payment, 8),
+            )
+
+        position.metadata["last_funding_ms"] = max(event for event, _ in due)
 
     # ------------------------------------------------------------------ #
     def _close_position(
@@ -801,7 +888,7 @@ class BacktestEngine:
         timestamp: int,
         data: BacktestData,
     ) -> None:
-        series = self.candles.get(position.symbol, self.config.timeframes.primary)
+        series = self.candles.get(position.symbol, self.decision_interval)
         bar = series.last if series else None
         liquidity = self._liquidity(data, exit_price)
 
@@ -829,12 +916,47 @@ class BacktestEngine:
         self.cost_breakdown.spread_cost += fill.spread_cost
         self.cost_breakdown.latency_cost += fill.latency_cost
 
-        gross = (filled - position.entry_price) * position.quantity * position.direction.sign
+        # -- the cost ledger -------------------------------------------------
+        # One accounting, computed once, so nothing downstream can double-count.
+        #
+        # `gross` uses the FILLED prices, which already contain spread, slippage
+        # and latency. `reference_gross` uses the prices the decision was made
+        # at. The difference between them IS the execution cost, which is why
+        # subtracting execution costs from `gross` again would be wrong — and is
+        # exactly the trap a report walking the fields naively would fall into.
+        sign = position.direction.sign
+        entry_reference = float(
+            position.metadata.get("entry_reference_price", position.entry_price)
+        )
+        gross = (filled - position.entry_price) * position.quantity * sign
+        reference_gross = (exit_price - entry_reference) * position.quantity * sign
+
         exit_fee = (
             fill.fee if fill.filled else filled * position.quantity * self.config.backtest.taker_fee
         )
         fees = position.entry_fee + exit_fee
         net = gross - fees - position.funding_paid
+
+        entry_spread = float(position.metadata.get("entry_spread_cost", 0.0))
+        entry_latency = float(position.metadata.get("entry_latency_cost", 0.0))
+        spread_cost = entry_spread + fill.spread_cost
+        latency_cost = entry_latency + fill.latency_cost
+        execution_costs = spread_cost + position.entry_slippage + slippage_cost + latency_cost
+
+        # The identity must hold to floating-point tolerance. A drift here means
+        # a cost is counted twice or not at all, and every derived figure —
+        # expectancy, cost ratio, edge calibration — is wrong by that amount.
+        identity_error = (reference_gross - execution_costs - fees - position.funding_paid) - net
+        if abs(identity_error) > max(1e-9, abs(net) * 1e-6):
+            log.error(
+                "cost_ledger_does_not_balance",
+                symbol=position.symbol,
+                error=identity_error,
+                reference_gross=reference_gross,
+                execution_costs=execution_costs,
+                net=net,
+                message="a cost is double-counted or missing",
+            )
 
         self.balance += net
         self.equity = self.balance
@@ -859,6 +981,13 @@ class BacktestEngine:
             funding=position.funding_paid,
             slippage_cost=position.entry_slippage + slippage_cost,
             net_pnl=net,
+            reference_gross_pnl=reference_gross,
+            entry_fee=position.entry_fee,
+            exit_fee=exit_fee,
+            spread_cost=spread_cost,
+            entry_slippage=position.entry_slippage,
+            exit_slippage=slippage_cost,
+            latency_cost=latency_cost,
             exit_reason=reason,
             regime=position.regime,
             opportunity_score=position.opportunity_score,
@@ -866,6 +995,11 @@ class BacktestEngine:
             consensus_score=position.metadata.get("consensus_score", 0.0),
             entry_notional=position.entry_notional,
             initial_risk=position.initial_risk,
+            metadata={
+                "primary_strategy": position.metadata.get("primary_strategy", position.strategy),
+                "contributing_strategies": position.metadata.get("contributing_strategies", []),
+                "contribution_weights": position.metadata.get("contribution_weights", {}),
+            },
         )
         self.trades.append(trade)
         self.cost_breakdown.add_trade(trade)
@@ -920,9 +1054,13 @@ class BacktestEngine:
 
     # ------------------------------------------------------------------ #
     def _next_open(self, data: BacktestData, timestamp: int) -> float | None:
-        """The open of the first bar starting after `timestamp`."""
-        primary = self.config.timeframes.primary
-        for candle in data.primary(primary):
+        """The open of the first DECISION bar starting after `timestamp`.
+
+        Uses the decision interval, not the strategies' primary: filling a
+        1-minute decision at the next 5-minute open would impose four minutes of
+        delay the live system does not have.
+        """
+        for candle in data.primary(self.decision_interval):
             if candle.open_time > timestamp:
                 return candle.open
         return None
@@ -996,22 +1134,79 @@ class BacktestEngine:
         )
 
     def _record_equity(self, data: dict[str, BacktestData], timestamp: int) -> None:
+        """Mark open positions at a price that EXISTED at ``timestamp``.
+
+        The subtlety this fixes: a signal is computed from bars closed at
+        ``timestamp`` and filled at the *next* bar's open. At the moment of
+        entry the newest closed bar is the one BEFORE the fill — so marking the
+        new position against `series.last_price` values it at a price from
+        before it existed, and books the entire open-to-previous-close gap as
+        instant PnL.
+
+        On a gappy market that is not a rounding error: a 1% overnight gap on a
+        5x position is 5% of margin appearing in the equity curve at the instant
+        of entry, inflating the curve and understating the drawdown that follows.
+
+        A position opened at this very timestamp is therefore marked at its own
+        entry price — its true mark-to-market is zero until a bar actually
+        closes after it.
+        """
         unrealized = 0.0
         for symbol, position in self.positions.items():
-            series = self.candles.get(symbol, self.config.timeframes.primary)
-            price = series.last_price if series else position.entry_price
-            unrealized += position.unrealized_pnl(price)
-            _ = data
+            if position.opened_at >= timestamp:
+                # Opened this cycle: no bar has closed since the fill, so the
+                # only honest mark is the price we paid.
+                continue
+
+            series = self.candles.get(symbol, self.decision_interval)
+            last = series.last if series is not None else None
+            if last is None or last.close_time > timestamp:
+                # No closed bar at or before now: nothing observable to mark at.
+                continue
+            if last.close_time <= position.opened_at:
+                # The newest closed bar predates the fill. Marking against it
+                # would price the position before it existed.
+                continue
+
+            unrealized += position.unrealized_pnl(last.close)
+
+        _ = data
         self.equity = self.balance + unrealized
+        self.peak_equity = max(self.peak_equity, self.equity)
         self.equity_curve.append(EquityPoint(timestamp, self.equity))
 
-    def _result(self, started: float, start_ms: int, end_ms: int) -> BacktestResult:
-        from tradebot.core.types import Timeframe
+    def _equity_sampling_sec(self) -> float:
+        """Seconds between equity samples, measured rather than assumed.
 
-        try:
-            period = float(Timeframe(self.config.timeframes.primary).seconds) * 50
-        except ValueError:
-            period = 300.0 * 50
+        Sharpe and annualised volatility scale by the square root of the number
+        of samples per year, so this number is not cosmetic: getting it wrong by
+        a factor of 50 misstates Sharpe by a factor of ~7.
+
+        It used to be hardcoded as `primary_timeframe x 50`, from when equity
+        was sampled every 50 bars. Equity is now recorded every cycle, so that
+        constant was silently wrong.
+
+        The **median** consecutive gap, not the mean: a single long gap — a data
+        hole, or a symbol that stops printing — would drag a mean and distort
+        every derived ratio.
+        """
+        if len(self.equity_curve) < 3:
+            try:
+                return float(Timeframe(self.config.timeframes.primary).seconds)
+            except ValueError:
+                return 300.0
+
+        gaps = [
+            (later.timestamp - earlier.timestamp) / 1000.0
+            for earlier, later in zip(self.equity_curve, self.equity_curve[1:], strict=False)
+            if later.timestamp > earlier.timestamp
+        ]
+        if not gaps:
+            return 300.0
+        return float(np.median(gaps))
+
+    def _result(self, started: float, start_ms: int, end_ms: int) -> BacktestResult:
+        period = self._equity_sampling_sec()
 
         metrics = compute_metrics(self.trades, self.equity_curve, self.initial_capital, period)
         return BacktestResult(

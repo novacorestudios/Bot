@@ -220,6 +220,88 @@ numbers in it. Read in this order instead:
 days rather than extrapolated: compounding a one-hour gain to a year produces
 roughly 10³⁰⁰, and printing that as a "return" is worse than printing nothing.
 
+## Out-of-sample: two modes, and only one is a holdout
+
+`--split` alone gives `LIVE_LIKE_FORWARD`: **one continuous adaptive run**,
+partitioned at the date. Cooldowns, strategy allocation and the edge
+calculator's win-rate estimates keep adapting across the split, exactly as they
+would live. Faithful to deployment — and **not a clean holdout**, because the
+"out-of-sample" half was traded by a system that had already learned from the
+in-sample half.
+
+`--strict-oos` gives `STRICT_OOS`: a train engine runs to the split, its learned
+statistics are frozen and seeded into a **fresh** engine, and only that engine
+runs the test period. This is what "out-of-sample" is normally taken to mean,
+and it is the harder test.
+
+The run context records which mode produced a result. Calling the first one a
+holdout is the mistake the two labels exist to prevent.
+
+## Edge modes
+
+| Mode | Win probability comes from | Use for |
+|---|---|---|
+| `LIVE_FAITHFUL` | bootstrap: an unproven strategy is *assumed* to win at break-even plus a margin | reproducing what the live system would do |
+| `RESEARCH_STRICT` | measured evidence only; no evidence means no trades | asking whether an edge exists at all |
+
+`--edge-mode RESEARCH_STRICT` cannot manufacture a positive edge. A report must
+say which mode produced it, and the two must never be mixed across a split.
+
+## Data trust
+
+Decided **before** the run and carried with the result:
+
+| Condition | Verdict |
+|---|---|
+| damaged data (out-of-order, impossible OHLC, negative prices) | **REFUSED** |
+| a symbol missing a timeframe the strategies read | **REFUSED** |
+| gaps, with `--allow-degraded` | UNTRUSTED |
+| no stored `exchangeInfo` | UNTRUSTED |
+| funding enabled but no funding history | UNTRUSTED |
+
+An UNTRUSTED run may proceed and be inspected; its report carries a banner
+saying the numbers are not evidence. `strict=False` no longer turns damaged data
+into a confident result silently.
+
+## Decision cadence
+
+Decisions, fills, exits and marks run at the **finest timeframe the dataset
+holds** — normally 1m — while strategies read their own closed 3m/5m/15m/1h
+series. Evaluating on the 5m primary made each decision point stand in for
+twenty live ones and systematically undercounted short-lived setups.
+
+**15-second live decisions cannot be reconstructed from 1m OHLCV.** Four
+sub-intervals of a minute are not recoverable from its open, high, low and
+close. 1m is a floor on the discrepancy, not a removal of it.
+
+## The cost ledger
+
+Every trade carries a complete, non-overlapping accounting:
+
+```
+reference_gross_pnl          both legs at the prices the decision saw
+  - spread_cost
+  - entry_slippage
+  - exit_slippage
+  - latency_cost             = execution costs
+  - entry_fee - exit_fee
+  - funding
+  ------------------------
+  = net_pnl
+```
+
+`gross_pnl` is the PnL **as filled**, so execution costs are already inside it —
+subtracting them from that number double-counts. Use `reference_gross_pnl` for
+cost attribution. The identity is checked on every close and logged as an error
+if it drifts.
+
+## Funding
+
+Charged at the exchange's **actual published timestamps**, for exactly the events
+that fall strictly inside a position's life. A position opened at 07:59 pays the
+08:00 event; one opened at 08:00 does not, because the exchange's snapshot did
+not include it.
+
 ## Out-of-sample and walk-forward
 
 A single backtest over one period proves almost nothing — parameters chosen by
@@ -232,10 +314,22 @@ CONFIG_FILE=config/config.backtest.yaml \
 ```
 
 ```
-|---- train ----|- val -|- test -|
-         |---- train ----|- val -|- test -|
-                  |---- train ----|- val -|- test -|
+|---- train ----|-embargo-|- test -|
+         |---- train ----|-embargo-|- test -|
+                  |---- train ----|-embargo-|- test -|
 ```
+
+**This is a rolling train/test evaluation, not a 60/20/20
+train/validation/test protocol.** The middle window is an **embargo gap** — it
+is reserved and skipped, never evaluated. It exists because indicators look back
+hundreds of bars, so a test window starting immediately after training would be
+evaluated partly on indicator state computed from training data.
+
+Calling it "validation" would imply a model-selection step that does not exist:
+**no parameter optimisation is performed anywhere in this module.** Nothing is
+fitted, searched or selected; the strategies run with identical parameters in
+both windows, and "train" means only "the in-sample baseline for the efficiency
+ratio".
 
 Only the **test** windows count. What makes the result trustworthy is not a high
 average but **consistency**: a strategy that made everything in one fold and
