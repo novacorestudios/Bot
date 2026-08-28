@@ -333,9 +333,12 @@ class TestWalkForward:
         assert folds[0].train_start == 0
         assert folds[1].train_start == 7 * DAY_MS
         for fold in folds:
-            assert fold.train_end == fold.validation_start
-            assert fold.validation_end == fold.test_start
+            # The middle window is an embargo gap, not a validation set: it sits
+            # between train and test and is never evaluated.
+            assert fold.train_end == fold.embargo_start
+            assert fold.embargo_end == fold.test_start
             assert fold.test_end <= 100 * DAY_MS
+            assert fold.as_dict()["embargo_is_evaluated"] is False
 
     def test_test_windows_never_overlap_their_own_training_window(self):
         """The entire point: test data must be unseen."""

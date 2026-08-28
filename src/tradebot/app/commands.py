@@ -47,10 +47,7 @@ def _parse_date(text: str) -> int | None:
             return int(datetime.strptime(text, fmt).replace(tzinfo=UTC).timestamp() * 1000)
         except ValueError:
             continue
-    raise SystemExit(
-        f"cannot parse date: {text!r}\n"
-        f"  accepted forms: {', '.join(_DATE_FORMATS)}"
-    )
+    raise SystemExit(f"cannot parse date: {text!r}\n  accepted forms: {', '.join(_DATE_FORMATS)}")
 
 
 async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:

@@ -183,6 +183,9 @@ class WalkForwardAnalyzer:
         The embargo is skipped, not evaluated. See the module docstring.
         """
         train_ms = self.walk.train_days * DAY_MS
+        # The config key keeps its historical name so existing config files
+        # still load; the window it sizes is the embargo gap, not a
+        # validation set. See the module docstring.
         embargo_ms = self.walk.validation_days * DAY_MS
         test_ms = self.walk.test_days * DAY_MS
         step_ms = self.walk.step_days * DAY_MS

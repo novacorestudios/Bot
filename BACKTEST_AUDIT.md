@@ -544,3 +544,68 @@ carries a banner saying the numbers are not evidence.
 an empty list — and **every run quoted the fingerprint of an empty set**, which
 looks like a valid hash and identifies nothing. Now strips the `.manifest.json`
 suffix directly.
+
+## V3.1 verification — what actually ran
+
+Every gate below was executed against the tree at the V3.1 commits. Results are
+reported as they came back, including the one that could not run here.
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| Unit + integration suite | `pytest -q` | PASS — 1213 tests, 0 failures |
+| V3.1 regression tests | `pytest tests/integration/test_v31_correctness.py -q` | PASS — 62 tests |
+| Lint | `ruff check src tests scripts` | PASS |
+| Format | `ruff format --check src tests scripts` | PASS |
+| Types | `mypy src/tradebot` (strict via `pyproject.toml`) | PASS — 93 files, 0 errors |
+| Static analysis | `bandit -r src -c pyproject.toml -q` | PASS — 0 findings |
+| Dependency audit | `pip-audit -r requirements.txt --strict` | PASS — no known vulnerabilities |
+| Secret scan | `python scripts/check_secrets.py` | PASS — 161 files clean |
+| CLI end to end | `tradebot backtest --data ... --split ... --strict-oos` | PASS — exit 0 |
+| Docker image build | `docker build -f docker/Dockerfile -t tradebot:ci .` | **NOT RUN HERE** — see below |
+| Docker smoke tests | all six checks from the `build` job of `.github/workflows/ci.yml` | PASS on the stand-in image |
+
+### The Docker qualification is real, not a formality
+
+The shipped `docker/Dockerfile` **cannot be built in this environment**. Both
+`docker.io`'s blob CDN and `deb.debian.org` return `403 Forbidden` through the
+agent proxy, so the `# syntax=docker/dockerfile:1` frontend fetch and the
+`apt-get update` layers both fail. The build was attempted and failed on the
+frontend fetch, not on anything in the project.
+
+What was verified instead is a **stand-in image**: same `src/`, `config/`,
+`scripts/`, same `docker/entrypoint.sh`, same `ENTRYPOINT`/`CMD` contract, built
+from a reachable base mirror without the multi-stage `apt` layers. That proves
+the CLI contract the smoke test exercises — `validate-config` and `doctor` both
+exit 0 in `PAPER` mode with no credentials — but it does **not** prove the
+shipped Dockerfile builds. CI on GitHub Actions is the authority for that layer.
+
+All six checks the `build` job runs after the build were executed against that
+stand-in and passed:
+
+1. `validate-config` in `PAPER` mode with no credentials — exit 0
+2. `doctor` with no credentials and no network call — exit 0
+3. default `CMD` is exactly `["run"]`, not a shell
+4. `TRADING_MODE=LIVE` without the acknowledgement — exit **78** (`EX_CONFIG`)
+   and `REFUSING TO START` on stderr
+5. `TRADING_MODE=LIVE` against the testnet endpoint, acknowledgement set —
+   exit **78**
+6. the image runs as `tradebot`, not root
+
+### Out-of-sample run on the small local dataset
+
+The `--strict-oos` CLI run completed in 45s and took **zero trades** in both the
+train and the test window. That is a genuine `NO TRADES TAKEN`, reported as such
+rather than as a measured zero — one symbol over 25 hours does not clear the
+opportunity gate. It exercises the code path; it is not evidence about the
+strategies either way.
+
+### One test the rename broke
+
+`tests/unit/test_backtest.py::TestWalkForward::test_folds_tile_the_period_with_a_rolling_step`
+still asserted on `fold.validation_start` / `fold.validation_end` after the
+V3.1 rename to `embargo_start` / `embargo_end`, and failed with
+`AttributeError`. The full suite was red until it was updated to the new names
+and extended to assert `embargo_is_evaluated is False` — the property the
+rename exists to make visible. The `WalkForwardConfig.validation_days` **config
+key keeps its historical name** so existing config files still load; only the
+`Fold` field, which describes what the window *is*, was renamed.
