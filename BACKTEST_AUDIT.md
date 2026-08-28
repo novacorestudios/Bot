@@ -829,8 +829,9 @@ reported as they came back, including the one that could not run here.
 | Dependency audit | `pip-audit -r requirements.txt --strict` | PASS — no known vulnerabilities |
 | Secret scan | `python scripts/check_secrets.py` | PASS — 161 files clean |
 | `walkforward` end to end | `tradebot walkforward --data … --report …` | PASS — exit 0 |
-| Docker image build | `docker build -f docker/Dockerfile -t tradebot:ci .` | **FAILED HERE** — see below |
-| Docker smoke tests | all six checks from the CI `build` job | PASS on the stand-in image |
+| Docker image build | `docker build -f docker/Dockerfile -t tradebot:ci .` | **failed in the sandbox**, PASS on GitHub Actions — see below |
+| Docker smoke tests | all six checks from the CI `build` job | PASS — on CI, and on a stand-in image locally |
+| GitHub Actions | run 33187472334 on `c0f7fdc` | PASS — all six jobs green |
 
 ### The `walkforward` run, verbatim
 
@@ -879,8 +880,27 @@ checks the CI `build` job runs after the build pass against it:
 5. `TRADING_MODE=LIVE` against testnet with the acknowledgement — exit **78**
 6. the image runs as `tradebot`, not root
 
-That proves the CLI contract the smoke tests exercise. GitHub Actions is the
-authority for whether the shipped Dockerfile builds.
+That proves the CLI contract the smoke tests exercise, and nothing about the
+real build. GitHub Actions is the authority for that, and it has now answered.
+
+### GitHub Actions, run 33187472334 on `c0f7fdc`
+
+All six jobs green, and the Docker job built the **shipped** `docker/Dockerfile`
+in 54 seconds, then passed every smoke step:
+
+| Job | Result |
+| --- | --- |
+| Lint & type check | success |
+| Tests (unit) | success |
+| Tests (integration) | success — 10m01s, including the subprocess CLI tests |
+| Tests (failure) | success |
+| Security checks | success |
+| Docker build | success — image built, all six smoke steps passed |
+
+So the shipped Dockerfile does build. What the sandbox failure means is only
+that this environment cannot reach `deb.debian.org` or `docker.io`'s blob CDN;
+it was never evidence about the Dockerfile itself, and the stand-in image was
+the substitute for a check that has now been run for real.
 
 ### Status
 
