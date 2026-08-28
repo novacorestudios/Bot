@@ -910,3 +910,30 @@ the substitute for a check that has now been run for real.
 No strategy was added, no parameter was tuned, no threshold was moved. The
 purpose of V3.2 was to make the instrument trustworthy before it is pointed at
 real Binance history for the first time.
+
+## Known issue (documented, not fixed) — rejection-counter merge collision
+
+`engine.py` merges the pipeline's and the risk engine's rejection counters with
+`{**self.pipeline.rejections, **self.risk.rejections}`. Dict unpacking is
+last-wins, and two reasons are emitted by **both** counters — `LOW_OPPORTUNITY_SCORE`
+(`signals/pipeline.py` and `risk/engine.py`) and `INVALID_STOP` (both). Where
+both fire, the pipeline's count is silently replaced by the risk engine's. The
+report then shows a plausible integer that is one stage's count presented as the
+total, with nothing indicating the loss.
+
+It has not bitten any run so far: the risk-side score check is guarded by
+`preservation.enabled` and compares against a preservation-*raised* bar, which
+in NORMAL mode equals the base threshold the pipeline already enforced, so the
+risk stage records nothing. Both the June 2024 smoke run and the 7-day
+diagnostic close their funnels to the exact trade count with zero residual,
+which would not happen if a stage had been overwritten.
+
+It remains a latent defect because the masking is state-dependent: on a run with
+a real drawdown, preservation engages, the risk stage starts rejecting, and one
+funnel stage becomes under-reported precisely when the run is most worth
+studying. Severity P1 **reporting** — no effect on trading logic, PnL or the
+trust gate; the counters are observational.
+
+The fix is to keep the two counters separate in the report rather than merging
+them, since summing would destroy the stage attribution the funnel depends on.
+Deliberately not applied yet.

@@ -28,7 +28,7 @@ to round up into more risk than the budget allows.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from tradebot.core.config import RiskConfig
 from tradebot.core.logging import get_logger
@@ -54,6 +54,11 @@ class SizingResult:
     reason: RejectionReason | None = None
     detail: str = ""
     checks: dict[str, float] = field(default_factory=dict)
+    #: Observational only (V3.2 diagnostics). The two inputs that decide whether
+    #: a size is representable at all, carried out so a diagnostic can see the
+    #: distribution rather than only the verdict. Nothing reads them to decide.
+    stop_distance: float | None = None
+    raw_quantity: float | None = None
 
     @classmethod
     def reject(cls, reason: RejectionReason, detail: str, **checks: float) -> SizingResult:
@@ -168,6 +173,16 @@ class PositionSizer:
         # -- the core calculation ------------------------------------------ #
         raw_quantity = risk_amount / stop_distance
 
+        def observed(result: SizingResult) -> SizingResult:
+            """Attach the two inputs that decided representability.
+
+            `replace` copies every other field of the frozen dataclass verbatim,
+            so this annotates the decision without being able to alter it. The
+            returns above this point leave both `None`, which is the honest
+            record for a candidate rejected before a quantity ever existed.
+            """
+            return replace(result, stop_distance=stop_distance, raw_quantity=raw_quantity)
+
         # -- exposure ceiling ----------------------------------------------- #
         notional_cap = equity * cfg.max_symbol_exposure
         if max_notional is not None:
@@ -177,20 +192,24 @@ class PositionSizer:
 
         quantity = round_quantity(raw_quantity, symbol_info.step_size)
         if quantity <= 0:
-            return SizingResult.reject(
-                RejectionReason.SIZE_BELOW_MINIMUM,
-                f"risk-correct quantity {raw_quantity:.10g} rounds to zero at "
-                f"step size {symbol_info.step_size}",
-                raw_quantity=raw_quantity,
+            return observed(
+                SizingResult.reject(
+                    RejectionReason.SIZE_BELOW_MINIMUM,
+                    f"risk-correct quantity {raw_quantity:.10g} rounds to zero at "
+                    f"step size {symbol_info.step_size}",
+                    raw_quantity=raw_quantity,
+                )
             )
 
         if symbol_info.min_qty > 0 and quantity < symbol_info.min_qty:
-            return SizingResult.reject(
-                RejectionReason.SIZE_BELOW_MINIMUM,
-                f"quantity {quantity} below the symbol minimum "
-                f"{symbol_info.min_qty}; sizing up would exceed the risk budget",
-                quantity=quantity,
-                min_qty=symbol_info.min_qty,
+            return observed(
+                SizingResult.reject(
+                    RejectionReason.SIZE_BELOW_MINIMUM,
+                    f"quantity {quantity} below the symbol minimum "
+                    f"{symbol_info.min_qty}; sizing up would exceed the risk budget",
+                    quantity=quantity,
+                    min_qty=symbol_info.min_qty,
+                )
             )
 
         notional = quantity * entry_price
@@ -199,17 +218,19 @@ class PositionSizer:
         if symbol_info.min_notional > 0 and notional < symbol_info.min_notional:
             required = min_quantity_for_notional(symbol_info, entry_price)
             implied_risk = required * stop_distance
-            return SizingResult.reject(
-                RejectionReason.NOTIONAL_BELOW_MINIMUM,
-                f"risk-correct notional {notional:.4f} is below the symbol "
-                f"minimum {symbol_info.min_notional}. Meeting it would require "
-                f"{required:.10g} units, risking {implied_risk:.4f} "
-                f"({safe_div(implied_risk, equity, 0) * 100:.2f}% of equity) "
-                f"instead of {risk_amount:.4f}. Skipping rather than oversizing.",
-                notional=notional,
-                min_notional=symbol_info.min_notional,
-                implied_risk=implied_risk,
-                budgeted_risk=risk_amount,
+            return observed(
+                SizingResult.reject(
+                    RejectionReason.NOTIONAL_BELOW_MINIMUM,
+                    f"risk-correct notional {notional:.4f} is below the symbol "
+                    f"minimum {symbol_info.min_notional}. Meeting it would require "
+                    f"{required:.10g} units, risking {implied_risk:.4f} "
+                    f"({safe_div(implied_risk, equity, 0) * 100:.2f}% of equity) "
+                    f"instead of {risk_amount:.4f}. Skipping rather than oversizing.",
+                    notional=notional,
+                    min_notional=symbol_info.min_notional,
+                    implied_risk=implied_risk,
+                    budgeted_risk=risk_amount,
+                )
             )
 
         actual_risk = quantity * stop_distance
@@ -224,30 +245,36 @@ class PositionSizer:
         leverage = max(cfg.min_leverage, leverage)
 
         if needed_leverage > volatility_ceiling:
-            return SizingResult.reject(
-                RejectionReason.LEVERAGE_LIMIT,
-                f"position needs {needed_leverage}x but volatility "
-                f"{volatility:.4f} caps leverage at {volatility_ceiling}x",
-                needed_leverage=needed_leverage,
-                volatility_ceiling=volatility_ceiling,
-                volatility=volatility,
+            return observed(
+                SizingResult.reject(
+                    RejectionReason.LEVERAGE_LIMIT,
+                    f"position needs {needed_leverage}x but volatility "
+                    f"{volatility:.4f} caps leverage at {volatility_ceiling}x",
+                    needed_leverage=needed_leverage,
+                    volatility_ceiling=volatility_ceiling,
+                    volatility=volatility,
+                )
             )
         if needed_leverage > symbol_info.max_leverage:
-            return SizingResult.reject(
-                RejectionReason.LEVERAGE_LIMIT,
-                f"position needs {needed_leverage}x but the symbol allows at "
-                f"most {symbol_info.max_leverage}x",
-                needed_leverage=needed_leverage,
-                symbol_max=symbol_info.max_leverage,
+            return observed(
+                SizingResult.reject(
+                    RejectionReason.LEVERAGE_LIMIT,
+                    f"position needs {needed_leverage}x but the symbol allows at "
+                    f"most {symbol_info.max_leverage}x",
+                    needed_leverage=needed_leverage,
+                    symbol_max=symbol_info.max_leverage,
+                )
             )
 
         margin_required = notional / leverage
         if margin_budget > 0 and margin_required > margin_budget:
-            return SizingResult.reject(
-                RejectionReason.MARGIN_LIMIT,
-                f"margin {margin_required:.4f} exceeds the available {margin_budget:.4f}",
-                margin_required=margin_required,
-                margin_budget=margin_budget,
+            return observed(
+                SizingResult.reject(
+                    RejectionReason.MARGIN_LIMIT,
+                    f"margin {margin_required:.4f} exceeds the available {margin_budget:.4f}",
+                    margin_required=margin_required,
+                    margin_budget=margin_budget,
+                )
             )
 
         # -- liquidation must sit well beyond the stop ----------------------- #
@@ -257,35 +284,39 @@ class PositionSizer:
         distance_multiple = safe_div(liquidation_distance, stop_distance, 0.0)
 
         if distance_multiple < cfg.min_liquidation_distance_multiple:
-            return SizingResult.reject(
-                RejectionReason.LIQUIDATION_TOO_CLOSE,
-                f"at {leverage}x, liquidation sits {distance_multiple:.2f}x the "
-                f"stop distance away; {cfg.min_liquidation_distance_multiple}x "
-                f"is required. The exchange would close this position before the "
-                f"stop could.",
-                leverage=float(leverage),
-                distance_multiple=distance_multiple,
-                liquidation_price=liquidation,
+            return observed(
+                SizingResult.reject(
+                    RejectionReason.LIQUIDATION_TOO_CLOSE,
+                    f"at {leverage}x, liquidation sits {distance_multiple:.2f}x the "
+                    f"stop distance away; {cfg.min_liquidation_distance_multiple}x "
+                    f"is required. The exchange would close this position before the "
+                    f"stop could.",
+                    leverage=float(leverage),
+                    distance_multiple=distance_multiple,
+                    liquidation_price=liquidation,
+                )
             )
 
-        return SizingResult(
-            ok=True,
-            quantity=quantity,
-            notional=notional,
-            leverage=leverage,
-            risk_amount=actual_risk,
-            margin_required=margin_required,
-            liquidation_price=liquidation,
-            liquidation_distance_multiple=distance_multiple,
-            checks={
-                "stop_distance": stop_distance,
-                "stop_distance_pct": safe_div(stop_distance, entry_price, 0.0),
-                "risk_fraction_used": safe_div(actual_risk, equity, 0.0),
-                "budgeted_risk": risk_amount,
-                "needed_leverage": float(needed_leverage),
-                "volatility_ceiling": float(volatility_ceiling),
-                "maintenance_rate": maintenance_rate,
-            },
+        return observed(
+            SizingResult(
+                ok=True,
+                quantity=quantity,
+                notional=notional,
+                leverage=leverage,
+                risk_amount=actual_risk,
+                margin_required=margin_required,
+                liquidation_price=liquidation,
+                liquidation_distance_multiple=distance_multiple,
+                checks={
+                    "stop_distance": stop_distance,
+                    "stop_distance_pct": safe_div(stop_distance, entry_price, 0.0),
+                    "risk_fraction_used": safe_div(actual_risk, equity, 0.0),
+                    "budgeted_risk": risk_amount,
+                    "needed_leverage": float(needed_leverage),
+                    "volatility_ceiling": float(volatility_ceiling),
+                    "maintenance_rate": maintenance_rate,
+                },
+            )
         )
 
     @staticmethod

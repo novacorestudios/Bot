@@ -52,6 +52,11 @@ class AggregationResult:
     long_weight: float = 0.0
     short_weight: float = 0.0
     considered: int = 0
+    #: Observational only (V3.2 diagnostics). How many strategies agreed on the
+    #: chosen direction, and the consensus score — `None` when the candidate was
+    #: rejected before that value existed. Nothing reads these to decide.
+    agreeing: int | None = None
+    consensus: float | None = None
 
     @property
     def accepted(self) -> bool:
@@ -88,6 +93,7 @@ class SignalAggregator:
                 RejectionReason.NO_SIGNAL,
                 "no strategy produced a direction",
                 considered=len(signals),
+                agreeing=0,
             )
 
         # Confidence below the floor is treated as no opinion at all.
@@ -99,6 +105,7 @@ class SignalAggregator:
                 RejectionReason.LOW_CONFIDENCE,
                 f"best confidence {best.confidence:.0f} below {cfg.min_signal_confidence:.0f}",
                 considered=len(signals),
+                agreeing=0,
             )
 
         def weight_of(signal: Signal) -> float:
@@ -126,6 +133,7 @@ class SignalAggregator:
                 long_weight=long_weight,
                 short_weight=short_weight,
                 considered=len(signals),
+                agreeing=len(agreeing),
             )
 
         # -- conflict: disagreement means stand aside ----------------------- #
@@ -139,6 +147,7 @@ class SignalAggregator:
                 long_weight=long_weight,
                 short_weight=short_weight,
                 considered=len(signals),
+                agreeing=len(agreeing),
             )
 
         # -- breadth: one strategy is an opinion, several are a consensus ---- #
@@ -150,6 +159,7 @@ class SignalAggregator:
                 long_weight=long_weight,
                 short_weight=short_weight,
                 considered=len(signals),
+                agreeing=len(agreeing),
             )
 
         consensus = self._consensus_score(agreeing, opposing, agree_weight, oppose_weight, weights)
@@ -161,6 +171,8 @@ class SignalAggregator:
                 long_weight=long_weight,
                 short_weight=short_weight,
                 considered=len(signals),
+                agreeing=len(agreeing),
+                consensus=consensus,
             )
 
         entry, stop, target = self._combine_levels(agreeing, direction, weight_of)
@@ -199,10 +211,17 @@ class SignalAggregator:
                 long_weight=long_weight,
                 short_weight=short_weight,
                 considered=len(signals),
+                agreeing=len(agreeing),
+                consensus=consensus,
             )
 
         return AggregationResult(
-            signal, long_weight=long_weight, short_weight=short_weight, considered=len(signals)
+            signal,
+            long_weight=long_weight,
+            short_weight=short_weight,
+            considered=len(signals),
+            agreeing=len(agreeing),
+            consensus=consensus,
         )
 
     # ------------------------------------------------------------------ #

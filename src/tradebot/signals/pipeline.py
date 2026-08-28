@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from tradebot.core.config import TunableConfig
 from tradebot.core.logging import get_logger
@@ -32,6 +32,9 @@ from tradebot.signals.aggregator import SignalAggregator
 from tradebot.signals.edge import EdgeCalculator, EdgeDecision
 from tradebot.signals.opportunity import OpportunityInputs, OpportunityScorer
 from tradebot.strategies.base import MarketView
+
+if TYPE_CHECKING:
+    from tradebot.backtesting.diagnostics import CandidateRecorder
 from tradebot.strategies.registry import StrategyRegistry
 
 log = get_logger(__name__)
@@ -113,6 +116,11 @@ class SignalPipeline:
         self.accepted = 0
         self.rejections: dict[str, int] = {}
 
+        #: Observational only. `None` in every normal run; a diagnostic attaches
+        #: a CandidateRecorder here to capture the scalars each gate thresholds.
+        #: Nothing in this class reads it to decide anything.
+        self.recorder: CandidateRecorder | None = None
+
     def evaluate(
         self,
         view: MarketView,
@@ -162,6 +170,8 @@ class SignalPipeline:
                 signals,
                 long_weight=aggregation.long_weight,
                 short_weight=aggregation.short_weight,
+                agreeing=aggregation.agreeing,
+                consensus=aggregation.consensus,
             )
 
         signal = aggregation.signal
@@ -216,6 +226,8 @@ class SignalPipeline:
                 opportunity_score=opportunity_score.total,
                 components=opportunity_score.components,
                 expected_net_edge=edge.expected_net,
+                agreeing=len(signal.contributing),
+                consensus=signal.consensus_score,
             )
 
         if not edge.accepted:
@@ -235,9 +247,20 @@ class SignalPipeline:
                 win_probability=edge.estimate.win_probability,
                 breakeven_win_rate=breakeven,
                 opportunity_score=opportunity_score.total,
+                agreeing=len(signal.contributing),
+                consensus=signal.consensus_score,
             )
 
         self.accepted += 1
+        if self.recorder is not None:
+            self.recorder.record(
+                symbol,
+                "complete",
+                None,
+                agreeing=len(signal.contributing),
+                consensus=signal.consensus_score,
+                expected_net=edge.expected_net,
+            )
         opportunity = Opportunity(
             symbol=symbol,
             signal=signal,
@@ -291,6 +314,17 @@ class SignalPipeline:
         **audit: Any,
     ) -> PipelineResult:
         self.rejections[reason.value] = self.rejections.get(reason.value, 0) + 1
+        if self.recorder is not None:
+            # Purely additive: `audit` is already built for the log, and nothing
+            # below reads what is recorded here.
+            self.recorder.record(
+                symbol,
+                stage,
+                reason.value,
+                agreeing=audit.get("agreeing"),
+                consensus=audit.get("consensus"),
+                expected_net=audit.get("expected_net_edge"),
+            )
         log.debug(
             "opportunity_rejected", symbol=symbol, reason=reason.value, stage=stage, detail=detail
         )

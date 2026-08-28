@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from tradebot.core.clock import SystemClock
 from tradebot.core.config import TunableConfig
@@ -60,6 +60,9 @@ from tradebot.risk.portfolio import PortfolioState, PortfolioTracker
 from tradebot.risk.preservation import CapitalPreservation
 from tradebot.risk.sizing import PositionSizer
 from tradebot.signals.pipeline import Opportunity
+
+if TYPE_CHECKING:
+    from tradebot.backtesting.diagnostics import CandidateRecorder
 
 log = get_logger(__name__)
 
@@ -104,6 +107,11 @@ class RiskEngine:
         self.kill_switches = KillSwitchManager(config.kill_switches, config.risk, clock)
         self.cooldowns = CooldownManager(config.cooldown, clock)
         self.allocator = StrategyAllocator(config.allocation)
+
+        #: Observational only. `None` in every normal run; a diagnostic attaches
+        #: a CandidateRecorder to capture what the sizer computed. Nothing in
+        #: this class reads it to decide anything.
+        self.recorder: CandidateRecorder | None = None
         self.preservation = CapitalPreservation(config.preservation, clock or SystemClock())
         self._seen_day_rollovers = 0
         # Evidence about which strategy works in which regime and on which
@@ -311,6 +319,15 @@ class RiskEngine:
             ),
             volatility=opportunity.market.volatility,
         )
+        if self.recorder is not None:
+            # Additive: recorded after the sizer has decided, read by nothing.
+            self.recorder.record(
+                symbol,
+                "sizing",
+                None if sizing.ok else (sizing.reason.value if sizing.reason else "SIZING_FAILED"),
+                stop_distance=sizing.stop_distance,
+                raw_quantity=sizing.raw_quantity,
+            )
         if not sizing.ok:
             return self._reject(
                 sizing.reason or RejectionReason.SIZE_BELOW_MINIMUM,
