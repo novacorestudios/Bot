@@ -5,6 +5,12 @@
 **Method:** every finding below was reproduced by executing code, not by reading
 it. The reproduction command is given for each.
 
+> **Status: superseded.** This document records the state of the system as
+> audited, and is kept unedited so the findings can be checked against what was
+> actually fixed. For the resolution of each finding, and for the current
+> verification status, see [`FINAL_AUDIT.md`](FINAL_AUDIT.md). The hardening
+> plan is [`IMPLEMENTATION_PLAN_V2.md`](IMPLEMENTATION_PLAN_V2.md).
+
 ---
 
 ## Summary

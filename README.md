@@ -18,16 +18,20 @@ funding.
 > table has to come from your own run. Where such a number would go, this
 > repository says **NOT TESTED**, deliberately.
 >
-> See [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §8 for what is and is
-> not established, and §9 for the gates that must pass before real money.
+> See [`FINAL_AUDIT.md`](FINAL_AUDIT.md) for the current, measured verification
+> status — what is proven, what is not, and the order in which the remaining
+> steps must happen before this touches real capital.
 
 ## What it does
 
 ```
-Binance market data → dynamic scanner → top 25 candidates → market regime
+Binance WebSocket + REST → MarketState (freshness per symbol)
+  → dynamic scanner → top 25 candidates → market regime
   → 8 strategies (regime-gated) → signal consensus → opportunity score
-  → EXPECTED NET EDGE → correlation → risk engine → position sizing
-  → execution → position monitor → exit engine → performance database
+  → EXPECTED NET EDGE → opportunity queue (best-first, expiring)
+  → capital preservation mode → correlation → risk engine → position sizing
+  → execution (order state machine) → position monitor → exit engine
+  → execution-quality feedback → performance database
 ```
 
 Two properties are worth stating up front, because they are what the design is
@@ -124,6 +128,9 @@ reach live trading.
 | Document | Contents |
 |---|---|
 | [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) | phases, gates, honest status, known risks |
+| [`AUDIT_REPORT.md`](AUDIT_REPORT.md) | the V1 deep technical audit — 22 findings, reproduced by execution |
+| [`IMPLEMENTATION_PLAN_V2.md`](IMPLEMENTATION_PLAN_V2.md) | the hardening plan for those findings |
+| [`FINAL_AUDIT.md`](FINAL_AUDIT.md) | **read this before running anything** — what is verified, what is not, and what must happen before real money |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | components, pipeline, concurrency, recovery |
 | [`docs/TRADING_ENGINE.md`](docs/TRADING_ENGINE.md) | the decision pipeline in detail |
 | [`docs/RISK_MANAGEMENT.md`](docs/RISK_MANAGEMENT.md) | sizing, leverage, limits, kill switches |
