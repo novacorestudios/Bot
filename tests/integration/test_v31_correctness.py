@@ -706,3 +706,51 @@ class TestIssue2CLIUsesTheScenarioRunner:
         assert "--allow-degraded" in flags
         assert "--edge-mode" in flags
         assert "--universe" in flags
+
+
+class TestArgumentsAreValidatedBeforeWork:
+    """Found while verifying V3.1: `--split` was parsed AFTER the scenarios
+    ran, so a mistyped date threw away 36 seconds of completed work. A CLI that
+    does expensive work and then rejects an argument is reporting a typo in the
+    most expensive way available."""
+
+    def test_every_date_is_parsed_before_the_data_is_loaded(self) -> None:
+        from tradebot.app.commands import run_backtest
+
+        source = inspect.getsource(run_backtest)
+        assert source.index("_parse_date(args.split)") < source.index("load_dataset(")
+        assert source.index("_parse_date(args.start)") < source.index("load_dataset(")
+
+    def test_the_iso_t_separator_is_accepted(self) -> None:
+        """It is what every other tool prints."""
+        from tradebot.app.commands import _parse_date
+
+        assert _parse_date("2024-01-01T18:00:00") == _parse_date("2024-01-01 18:00:00")
+
+    @pytest.mark.parametrize(
+        "text",
+        ["2024-01-01", "2024-01-01 18:00", "2024-01-01T18:00", "2024-01-01T18:00:00"],
+    )
+    def test_accepted_forms(self, text: str) -> None:
+        from tradebot.app.commands import _parse_date
+
+        assert isinstance(_parse_date(text), int)
+
+    def test_a_bad_date_names_the_accepted_forms(self) -> None:
+        from tradebot.app.commands import _parse_date
+
+        with pytest.raises(SystemExit, match="accepted forms"):
+            _parse_date("not-a-date")
+
+    def test_an_empty_date_is_none_not_an_error(self) -> None:
+        from tradebot.app.commands import _parse_date
+
+        assert _parse_date("") is None
+
+    def test_incoherent_ranges_are_rejected_up_front(self) -> None:
+        from tradebot.app.commands import run_backtest
+
+        source = inspect.getsource(run_backtest)
+        assert "--end must be after --start" in source
+        assert "--split must be after --start" in source
+        assert "--split must be before --end" in source

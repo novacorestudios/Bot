@@ -25,17 +25,32 @@ def _write_report(path: str, payload: dict[str, Any]) -> None:
     print(f"\nreport written to {target}")
 
 
+#: Accepted date forms, widest first. The ISO `T` separator is included because
+#: it is what every other tool prints, and rejecting it after a long run is a
+#: needlessly expensive way to report a typo.
+_DATE_FORMATS = (
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
+)
+
+
 def _parse_date(text: str) -> int | None:
     if not text:
         return None
     from datetime import UTC, datetime
 
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+    for fmt in _DATE_FORMATS:
         try:
             return int(datetime.strptime(text, fmt).replace(tzinfo=UTC).timestamp() * 1000)
         except ValueError:
             continue
-    raise SystemExit(f"cannot parse date: {text!r} (use YYYY-MM-DD)")
+    raise SystemExit(
+        f"cannot parse date: {text!r}\n"
+        f"  accepted forms: {', '.join(_DATE_FORMATS)}"
+    )
 
 
 async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:
@@ -58,6 +73,21 @@ async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:
     )
     from tradebot.backtesting.trust import TrustLevel, evaluate_trust
     from tradebot.data.store import DataStore
+
+    # Validate every argument BEFORE any work. This used to parse --split after
+    # the scenarios had run, so a mistyped date threw away the whole run.
+    start_ms = _parse_date(args.start)
+    end_ms = _parse_date(args.end)
+    split_ms = _parse_date(args.split) if args.split else None
+    seed = int(getattr(args, "seed", 42))
+
+    if start_ms and end_ms and end_ms <= start_ms:
+        raise SystemExit("--end must be after --start")
+    if split_ms is not None:
+        if start_ms and split_ms <= start_ms:
+            raise SystemExit("--split must be after --start")
+        if end_ms and split_ms >= end_ms:
+            raise SystemExit("--split must be before --end")
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     required = list(config.tunables.timeframes.all())
@@ -125,10 +155,6 @@ async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:
         print("strategies are assumed to win at break-even plus a margin, so this")
         print("run measures what WOULD happen if that held — not that it does.")
 
-    start_ms = _parse_date(args.start)
-    end_ms = _parse_date(args.end)
-    seed = int(getattr(args, "seed", 42))
-
     # -- all three scenarios, never one ------------------------------------- #
     manifests = store.manifests()
     scenarios = run_scenarios(
@@ -171,7 +197,6 @@ async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:
     payload["trust"] = trust.as_dict()
 
     # -- out-of-sample ------------------------------------------------------ #
-    split_ms = _parse_date(args.split) if args.split else None
     if split_ms:
         strict = bool(getattr(args, "strict_oos", False))
         print("\n" + "=" * 68)
