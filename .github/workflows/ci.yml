@@ -22,9 +22,9 @@ jobs:
           cache: pip
       - run: pip install -e ".[dev]" || pip install -r requirements-dev.txt
       - name: Ruff
-        run: ruff check src tests
+        run: ruff check src tests scripts
       - name: Ruff format check
-        run: ruff format --check src tests
+        run: ruff format --check src tests scripts
       # A real gate. It was `|| true` while typing debt existed; that debt is
       # now zero, so a new type error fails the build rather than being hidden.
       - name: Mypy
