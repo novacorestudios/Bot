@@ -41,6 +41,9 @@ from tradebot.core.types import (
     Trade,
     TradingMode,
 )
+from tradebot.execution.exits import ExitContext, ExitEvaluator, holding_edge
+from tradebot.execution.quality import ExecutionQuality, ExecutionRecord
+from tradebot.execution.state import OrderState
 from tradebot.market.candles import CandleStore
 from tradebot.market.microstructure import CostModel, snapshot_from_book
 from tradebot.market.regime import RegimeDetector
@@ -80,6 +83,18 @@ class TradingEngine:
         self.registry = StrategyRegistry.from_config(self.tunables)
         self.pipeline = SignalPipeline(self.tunables, self.registry, self.cost_model)
         self.risk = RiskEngine(self.tunables, self.candles, self.clock)
+        # Exit conditions the exchange cannot see: the clock, the regime, a
+        # flipped signal, an evaporated edge, and a stop that is no longer there.
+        self.exits = ExitEvaluator(self.tunables)
+        # Measures the gap between the cost the edge filter assumed and the
+        # cost actually paid, and feeds the difference back into the model.
+        self.execution_quality = ExecutionQuality(
+            min_samples=self.tunables.execution.quality_min_samples,
+            max_adjustment=self.tunables.execution.quality_max_adjustment,
+        )
+        #: Latest consensus per symbol, kept so a HELD symbol's exit can be
+        #: judged even after it drops out of the top-25 ranking.
+        self._consensus: dict[str, tuple[Direction, float, int]] = {}
         # Candidates are scored first and spent best-first, so a merely
         # adequate opportunity high in the MARKET ranking cannot take the slot
         # a better trade needed (AUDIT_REPORT.md M-7).
@@ -642,6 +657,8 @@ class TradingEngine:
                 now_ms=self.clock.now_ms(),
             )
 
+            self._record_consensus(symbol, view)
+
             pipeline_result = self.pipeline.evaluate(
                 view,
                 candidate.market_score,
@@ -764,6 +781,7 @@ class TradingEngine:
                 self.repository.record_order(result.order)
 
         if result.success and result.position is not None:
+            self._record_execution(opportunity, decision.intent, result)
             if self.repository is not None:
                 self.repository.record_position(result.position)
             self.telegram.notify_trade_opened(
@@ -775,6 +793,54 @@ class TradingEngine:
             self.risk.record_slippage(result.slippage)
         elif not result.success:
             self.risk.record_order_rejected(opportunity.symbol)
+
+    def _record_execution(self, opportunity: Any, intent: Any, result: Any) -> None:
+        """Compare the fill we got against the cost the edge filter assumed.
+
+        Recorded whether the trade turns out well or badly: this measures the
+        MODEL, not the trade. A strategy can be right about direction and still
+        lose money to an execution cost nobody measured.
+        """
+        order = result.order
+        position = result.position
+        if order is None or position is None:
+            return
+
+        reference = intent.metadata.get("reference_price", position.entry_price)
+        # What the edge filter assumed a single leg would cost.
+        costs = opportunity.edge.estimate.costs
+        expected_leg_cost = costs.slippage / 2.0 + costs.spread_cost / 2.0
+
+        self.execution_quality.record(
+            ExecutionRecord(
+                symbol=position.symbol,
+                direction=position.direction,
+                order_type=order.order_type.value,
+                is_entry=True,
+                reference_price=reference,
+                fill_price=position.entry_price,
+                quantity=position.quantity,
+                expected_cost=expected_leg_cost,
+                at_ms=self.clock.now_ms(),
+            )
+        )
+        self._recalibrate_costs(position.symbol)
+
+    def _recalibrate_costs(self, symbol: str) -> None:
+        """Push the measured bias back into the cost model.
+
+        This is the loop that keeps the edge filter honest. Without it, a
+        systematically optimistic slippage assumption approves trades that were
+        never profitable, and the losses read as strategy failure rather than as
+        the measurement error they are.
+        """
+        if not self.execution_quality.is_calibrated():
+            return
+        self.cost_model.set_slippage_adjustment(self.execution_quality.slippage_adjustment())
+        if self.execution_quality.is_calibrated(symbol):
+            self.cost_model.set_slippage_adjustment(
+                self.execution_quality.slippage_adjustment(symbol), symbol
+            )
 
     # ------------------------------------------------------------------ #
     async def _monitor_loop(self) -> None:
@@ -806,31 +872,103 @@ class TradingEngine:
                 continue
             position.update_extremes(price)
 
-            reason = self._exit_reason(position, price, now_ms)
-            if reason is not None:
-                await self.execution.close_position(symbol, reason)
+            decision = self.exits.evaluate(position, self._exit_context(position, price, now_ms))
+            if decision.should_exit and decision.reason is not None:
+                await self.execution.close_position(symbol, decision.reason, decision.detail)
                 continue
 
             await self._update_trailing_stop(position, price)
 
-    def _exit_reason(self, position: Any, price: float, now_ms: int) -> ExitReason | None:
-        """Decide whether this position should be closed now.
+    def _exit_context(self, position: Any, price: float, now_ms: int) -> ExitContext:
+        """Gather everything the exit rules read, without deciding anything."""
+        symbol = position.symbol
 
-        Stop and target are handled by resting exchange orders; this covers the
-        conditions the exchange cannot know about.
+        regime_blocks = False
+        if self.scanner is not None and self.scanner.last_result is not None:
+            state = self.scanner.last_result.regimes.get(symbol)
+            regime_blocks = state is not None and state.regime.blocks_entries
+
+        direction: Direction | None = None
+        confidence = 0.0
+        latest = self._consensus.get(symbol)
+        if latest is not None:
+            seen_direction, seen_confidence, at_ms = latest
+            # A consensus older than one signal cycle is not evidence of a flip;
+            # it is evidence that we have not looked recently.
+            if (now_ms - at_ms) / 1000.0 <= self.tunables.scanner.signal_interval_sec * 3:
+                direction, confidence = seen_direction, seen_confidence
+
+        return ExitContext(
+            price=price,
+            now_ms=now_ms,
+            signal_direction=direction,
+            signal_confidence=confidence,
+            regime_blocks=regime_blocks,
+            holding_edge=self._holding_edge(position, price),
+            stop_order_missing=self._stop_order_missing(position),
+        )
+
+    def _record_consensus(self, symbol: str, view: MarketView) -> None:
+        """Note the current consensus, whether or not it becomes a trade.
+
+        Recorded from the aggregator rather than from accepted opportunities:
+        an opportunity rejected for cost or correlation still tells us which way
+        the strategies are leaning, and that is exactly what a flip needs.
         """
-        if position.duration_sec(now_ms) >= self.tunables.trade.max_duration_sec:
-            return ExitReason.TIME_LIMIT
+        signals, weights = self.registry.evaluate(view, time.time())
+        if not weights:
+            return
+        aggregation = self.pipeline.aggregator.aggregate(
+            symbol, signals, weights, view.regime, view.now_ms
+        )
+        signal = aggregation.signal
+        if signal is not None:
+            self._consensus[symbol] = (signal.direction, signal.confidence, view.now_ms)
 
-        if self.tunables.trade.exit_on_regime_change and self.scanner is not None:
-            result = self.scanner.last_result
-            if result is not None:
-                state = result.regimes.get(position.symbol)
-                if state is not None and state.regime.blocks_entries:
-                    return ExitReason.REGIME_CHANGE
+    def _holding_edge(self, position: Any, price: float) -> float | None:
+        """Expected net edge of CONTINUING to hold, per unit of notional."""
+        if not self.tunables.trade.exit_on_negative_edge:
+            return None
 
-        _ = price
-        return None
+        book = self.market.book(position.symbol)
+        liquidity = snapshot_from_book(position.symbol, book)
+        notional = position.quantity * price
+        remaining_sec = max(
+            0.0,
+            self.tunables.trade.max_duration_sec - position.duration_sec(self.clock.now_ms()),
+        )
+        costs = self.cost_model.estimate(
+            direction=position.direction,
+            notional=notional,
+            liquidity=liquidity,
+            funding_rate=self.market.funding_rate(position.symbol),
+            expected_duration_sec=remaining_sec,
+            seconds_to_funding=self.market.seconds_to_funding(position.symbol),
+        )
+        # The entry fee is already paid; only the exit leg is still ahead.
+        forward_cost = costs.total - costs.entry_fee
+
+        return holding_edge(
+            position,
+            price,
+            self.pipeline.edge_calculator.win_probability(position.strategy),
+            forward_cost,
+        )
+
+    def _stop_order_missing(self, position: Any) -> bool:
+        """True when the tracker says no protective stop is resting.
+
+        Only trusted once the order has been through the state machine: an
+        unknown id means we never tracked it, which is not the same as knowing
+        it is gone, and closing a healthy position on that guess would be worse
+        than the risk it is meant to avert.
+        """
+        if self.execution is None or not position.stop_order_id:
+            return False
+        tracked = self.execution.tracker.get(position.stop_order_id)
+        if tracked is None:
+            return False
+        return tracked.is_terminal and tracked.state is not OrderState.FILLED
 
     async def _update_trailing_stop(self, position: Any, price: float) -> None:
         cfg = self.tunables.trailing_stop
@@ -996,6 +1134,7 @@ class TradingEngine:
         self.total_pnl += trade.net_pnl
 
         realised_edge = trade.net_pnl / trade.entry_notional if trade.entry_notional > 0 else 0.0
+        self._record_exit_execution(trade)
         self.risk.record_trade_closed(
             trade.symbol,
             trade.strategy,
@@ -1003,6 +1142,8 @@ class TradingEngine:
             r_multiple=trade.r_multiple,
             volatility=trade.metadata.get("volatility", 0.0),
             reason=trade.exit_reason.value,
+            regime=trade.regime,
+            pnl=trade.net_pnl,
         )
         self.pipeline.edge_calculator.record_result(
             trade.strategy,
@@ -1017,6 +1158,37 @@ class TradingEngine:
         if self.repository is not None:
             self.repository.record_trade(trade, realised_edge)
         self.telegram.notify_trade_closed(trade)
+
+    def _record_exit_execution(self, trade: Trade) -> None:
+        """The exit leg's execution quality.
+
+        The reference is the level we were aiming for — the stop or the target,
+        whichever this exit was — so the number answers "how much worse than the
+        level did we actually get out at?", which is the cost the edge model
+        needs to predict.
+        """
+        reference = {
+            ExitReason.STOP_LOSS: trade.stop_loss,
+            ExitReason.TRAILING_STOP: trade.stop_loss,
+            ExitReason.TAKE_PROFIT: trade.take_profit,
+        }.get(trade.exit_reason, trade.exit_price)
+        if reference <= 0:
+            return
+
+        self.execution_quality.record(
+            ExecutionRecord(
+                symbol=trade.symbol,
+                direction=trade.direction,
+                order_type="MARKET",
+                is_entry=False,
+                reference_price=reference,
+                fill_price=trade.exit_price,
+                quantity=trade.quantity,
+                expected_cost=self.tunables.edge.taker_fee,
+                at_ms=self.clock.now_ms(),
+            )
+        )
+        self._recalibrate_costs(trade.symbol)
 
     async def _on_risk_event(self, event: Event) -> None:
         risk_event: RiskEvent = event.payload
@@ -1112,6 +1284,8 @@ class TradingEngine:
             "market_data": self.market.stats(),
             "preservation": self.risk.preservation.state.as_dict(),
             "queued_opportunities": len(self.opportunities),
+            "exits": self.exits.stats(),
+            "execution_quality": self.execution_quality.stats(),
             "rejections": [
                 {"reason": reason, "count": count}
                 for reason, count in sorted(rejections.items(), key=lambda kv: -kv[1])[:12]
@@ -1168,6 +1342,22 @@ class TradingEngine:
     def queue_view(self) -> dict[str, Any]:
         """What is waiting, in the order it will be offered to risk."""
         return {"stats": self.opportunities.stats(), "queue": self.opportunities.report()}
+
+    def matrices_view(self) -> dict[str, Any]:
+        """Which strategy works in which regime, and on which symbol."""
+        return self.risk.matrices.report()
+
+    def execution_quality_view(self) -> dict[str, Any]:
+        """Expected versus actual execution cost, per symbol."""
+        return {
+            "stats": self.execution_quality.stats(),
+            "symbols": self.execution_quality.report(),
+            "worst": self.execution_quality.worst_symbols(),
+            "edge_calibration": {
+                name: self.pipeline.edge_calculator.realised_vs_expected(name)
+                for name in sorted(self.registry.strategies)
+            },
+        }
 
     def market_data_view(self) -> dict[str, Any]:
         """Feed health: what is live, what is lagging, what is stale."""

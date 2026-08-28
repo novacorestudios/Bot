@@ -100,6 +100,18 @@ def create_app(engine: Any, token: str = "") -> FastAPI:  # nosec B107
         authorise(request)
         return engine.risk_view()
 
+    @app.get("/api/matrices")
+    async def matrices(request: Request) -> dict[str, Any]:
+        """Strategy x regime and symbol x strategy performance."""
+        authorise(request)
+        return engine.matrices_view()
+
+    @app.get("/api/execution-quality")
+    async def execution_quality(request: Request) -> dict[str, Any]:
+        """Expected versus actual execution cost, and edge calibration."""
+        authorise(request)
+        return engine.execution_quality_view()
+
     @app.get("/api/queue")
     async def queue(request: Request) -> dict[str, Any]:
         """Opportunities waiting, best first."""

@@ -88,6 +88,18 @@ preservation:
   # Equity never deployed, kept to pay funding, fees and adverse margin moves.
   capital_reserve_fraction: 0.10
 
+# Strategy x regime and symbol x strategy performance tables. Recording is
+# always on — the tables answer "is this strategy bad, or is it being run in the
+# wrong conditions?". Feeding them back into SELECTION is off by default:
+# suppressing a combination on a handful of trades is overfitting against your
+# own history. Turn it on once the tables have filled and you have read them.
+matrices:
+  feedback_enabled: false
+  strategy_regime_min_trades: 30
+  symbol_strategy_min_trades: 25
+  floor_expectancy_r: -0.25
+  min_multiplier: 0.0
+
 cooldown:
   base_seconds: 120
   after_loss_seconds: 420
@@ -337,6 +349,11 @@ execution:
   monitor_interval_sec: 1
   # Refuse to trade a symbol whose min notional exceeds this fraction of equity.
   max_min_notional_ratio: 0.5
+  # Execution-quality feedback. Fills are compared against the cost the edge
+  # filter assumed, and any systematic under-estimate is added back into the
+  # model — so the threshold a trade must clear rises to meet reality.
+  quality_min_samples: 10
+  quality_max_adjustment: 0.0020
 
 paper:
   # Simulated execution realism. Deliberately pessimistic.

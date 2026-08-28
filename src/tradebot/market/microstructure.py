@@ -89,6 +89,22 @@ class CostModel:
 
     def __init__(self, config: EdgeConfig) -> None:
         self.config = config
+        #: Measured bias between predicted and realised slippage, added to
+        #: every estimate. Set by the execution-quality feedback loop, and
+        #: never negative: the loop may make the model more careful, never
+        #: less. Keyed by symbol, with "" as the account-wide default.
+        self._slippage_adjustments: dict[str, float] = {}
+
+    def set_slippage_adjustment(self, adjustment: float, symbol: str = "") -> None:
+        """Record a measured slippage bias for this symbol (or globally)."""
+        self._slippage_adjustments[symbol] = max(0.0, adjustment)
+
+    def slippage_adjustment(self, symbol: str = "") -> float:
+        """The symbol's own measured bias, falling back to the global one."""
+        specific = self._slippage_adjustments.get(symbol)
+        if specific is not None:
+            return specific
+        return self._slippage_adjustments.get("", 0.0)
 
     # -- components --------------------------------------------------------- #
     def fee_rate(self, taker: bool) -> float:
@@ -104,20 +120,28 @@ class CostModel:
             return 0.0
         return from_bps(spread_bps) * self.config.spread_cost_fraction * sides
 
-    def slippage(self, notional: float, depth_notional: float) -> float:
+    def slippage(self, notional: float, depth_notional: float, symbol: str = "") -> float:
         """Base slippage plus a size-dependent impact term.
 
         Impact grows with the fraction of visible depth the order consumes. With
         a 75 USDT account on a liquid perpetual this term is negligible, which
         is the one genuine advantage of trading small.
+
+        The measured adjustment is added last: if fills have consistently been
+        worse than predicted, the threshold the edge filter must clear rises to
+        meet reality rather than the other way round.
         """
         base = from_bps(self.config.base_slippage_bps)
         if depth_notional <= 0:
             # No depth information: assume the order is significant. Being
             # pessimistic here rejects trades; being optimistic loses money.
-            return base * 3.0
+            return base * 3.0 + self.slippage_adjustment(symbol)
         participation = safe_div(notional, depth_notional, 1.0)
-        return base + self.config.impact_coefficient * base * participation
+        return (
+            base
+            + self.config.impact_coefficient * base * participation
+            + self.slippage_adjustment(symbol)
+        )
 
     def funding_cost(
         self,
@@ -166,7 +190,7 @@ class CostModel:
             spread_cost=self.spread_cost(
                 liquidity.spread_bps, sides=int(entry_taker) + int(exit_taker)
             ),
-            slippage=self.slippage(notional, depth) * 2,  # entry and exit
+            slippage=self.slippage(notional, depth, liquidity.symbol) * 2,  # entry and exit
             funding=self.funding_cost(
                 direction, funding_rate, expected_duration_sec, seconds_to_funding
             ),

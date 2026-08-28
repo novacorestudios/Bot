@@ -55,6 +55,7 @@ from tradebot.risk.allocation import StrategyAllocator, StrategyKillSwitch
 from tradebot.risk.cooldown import CooldownManager
 from tradebot.risk.correlation import CorrelationEngine
 from tradebot.risk.killswitch import KillSwitchManager
+from tradebot.risk.matrices import MatrixSet
 from tradebot.risk.portfolio import PortfolioState, PortfolioTracker
 from tradebot.risk.preservation import CapitalPreservation
 from tradebot.risk.sizing import PositionSizer
@@ -105,6 +106,9 @@ class RiskEngine:
         self.allocator = StrategyAllocator(config.allocation)
         self.preservation = CapitalPreservation(config.preservation, clock or SystemClock())
         self._seen_day_rollovers = 0
+        # Evidence about which strategy works in which regime and on which
+        # symbol. It may only ever reduce a weight, never raise one.
+        self.matrices = MatrixSet(config.matrices)
         self.strategy_kill_switch = StrategyKillSwitch(
             config.strategy_kill_switch, self.allocator, clock
         )
@@ -240,6 +244,18 @@ class RiskEngine:
                 )
             del self.suspended_strategies[strategy]
 
+        # -- 5b. matrix evidence ---------------------------------------------- #
+        # A strategy that loses money overall may be excellent in one regime and
+        # terrible in another; the aggregate hides both facts.
+        matrix_multiplier = self.matrices.multiplier(strategy, opportunity.regime, symbol)
+        if matrix_multiplier <= 0.0:
+            return self._reject(
+                RejectionReason.STRATEGY_DISABLED,
+                f"{strategy} has a losing record on {symbol} in "
+                f"{opportunity.regime.value} across enough trades to matter",
+                matrix_multiplier=matrix_multiplier,
+            )
+
         # -- 6. a stop is mandatory ------------------------------------------- #
         if signal.stop_loss <= 0:
             return self._reject(
@@ -262,6 +278,10 @@ class RiskEngine:
         if self.config.preservation.enabled:
             # Preservation scales the risk fraction; it never scales it up.
             risk_fraction *= self.preservation.risk_multiplier
+
+        # Likewise the matrices: a combination with a poor record is sized
+        # smaller, not merely allowed or refused.
+        risk_fraction *= matrix_multiplier
 
         remaining_budget = self.portfolio.remaining_risk_budget(state)
         if remaining_budget <= 0:
@@ -422,11 +442,14 @@ class RiskEngine:
         r_multiple: float,
         volatility: float = 0.0,
         reason: str = "",
+        regime: MarketRegime | str = MarketRegime.SIDEWAYS,
+        pnl: float = 0.0,
     ) -> None:
         """Update every component that learns from a completed trade."""
         self.kill_switches.record_trade_result(won)
         self.cooldowns.register_close(symbol, won, strategy, volatility, reason)
         self.allocator.record_trade(strategy, r_multiple)
+        self.matrices.record(strategy, regime, symbol, won, r_multiple, pnl)
 
         should_disable, detail = self.strategy_kill_switch.should_disable(strategy)
         if should_disable and strategy not in self.suspended_strategies:
@@ -491,6 +514,10 @@ class RiskEngine:
             "allocation": self.allocator.weights(list(self.allocator.performance)),
             "strategy_performance": self.allocator.report(),
             "preservation": self.preservation.stats(),
+            "matrices": {
+                "strategy_regime": self.matrices.strategy_regime.stats(),
+                "symbol_strategy": self.matrices.symbol_strategy.stats(),
+            },
         }
 
 

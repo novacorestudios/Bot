@@ -397,6 +397,12 @@ class ExecutionConfig(_Model):
     reconcile_interval_sec: int = Field(60, ge=5)
     monitor_interval_sec: float = Field(1.0, gt=0)
     max_min_notional_ratio: float = Field(0.5, gt=0, le=1)
+    #: Fills required before the measured slippage bias is fed back into the
+    #: cost model. A handful of fills is not evidence of a bias.
+    quality_min_samples: int = Field(10, ge=1)
+    #: Ceiling on that correction, so one pathological session cannot make the
+    #: cost model so pessimistic that nothing ever trades again.
+    quality_max_adjustment: float = Field(0.002, gt=0, le=0.05)
 
     @field_validator("entry_order_type")
     @classmethod
@@ -502,6 +508,30 @@ class PreservationConfig(_Model):
         return self
 
 
+class MatricesConfig(_Model):
+    """Strategy x regime and symbol x strategy performance tables.
+
+    Recording is always on — the tables are how an operator answers "is mean
+    reversion losing money because it is a bad strategy, or because it keeps
+    being run in a trend?".
+
+    Feeding them back into selection is a separate, OFF-by-default decision, and
+    deliberately so: suppressing a combination on a handful of trades is
+    overfitting against your own history. On a 75 USDT account taking a few
+    trades a day, a cell reaches ``min_trades`` after weeks, and until then the
+    honest answer is "not enough evidence". Turn ``feedback_enabled`` on once
+    the tables have filled and you have looked at them.
+    """
+
+    feedback_enabled: bool = False
+    strategy_regime_min_trades: int = Field(30, ge=5)
+    symbol_strategy_min_trades: int = Field(25, ge=5)
+    #: Expectancy in R at or below which a cell is fully suppressed.
+    floor_expectancy_r: float = Field(-0.25, lt=0)
+    #: How far a cell may be suppressed. 0.0 means "stop that combination".
+    min_multiplier: float = Field(0.0, ge=0, le=1)
+
+
 class HealthConfig(_Model):
     heartbeat_interval_sec: float = Field(5.0, gt=0)
     component_timeout_sec: float = Field(60.0, gt=0)
@@ -530,6 +560,7 @@ class TunableConfig(_Model):
     risk: RiskConfig = RiskConfig()
     kill_switches: KillSwitchConfig = KillSwitchConfig()
     preservation: PreservationConfig = PreservationConfig()
+    matrices: MatricesConfig = MatricesConfig()
     cooldown: CooldownConfig = CooldownConfig()
     scanner: ScannerConfig = ScannerConfig()
     timeframes: TimeframeConfig = TimeframeConfig()

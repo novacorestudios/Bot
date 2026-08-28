@@ -20,6 +20,7 @@ from tradebot.core.types import (
     MarketRegime,
     MarketScore,
     OpportunityScore,
+    Signal,
 )
 from tradebot.market.microstructure import LiquiditySnapshot
 from tradebot.signals.edge import EdgeDecision
@@ -37,6 +38,17 @@ def make_opportunity(
     direction: Direction = Direction.LONG,
     strategy: str = "momentum",
 ) -> Opportunity:
+    contributing = Signal(
+        symbol=symbol,
+        strategy=strategy,
+        direction=direction,
+        confidence=confidence,
+        entry_price=100.0,
+        stop_loss=99.5,
+        take_profit=101.0,
+        timeframe="5m",
+        signal_timestamp=0,
+    )
     signal = AggregatedSignal(
         symbol=symbol,
         direction=direction,
@@ -45,7 +57,7 @@ def make_opportunity(
         entry_price=100.0,
         stop_loss=99.5,
         take_profit=101.0,
-        contributing=(),
+        contributing=(contributing,),
         opposing=(),
         conflict_ratio=0.0,
         regime=MarketRegime.STRONG_TREND,
