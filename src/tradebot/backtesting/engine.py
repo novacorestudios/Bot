@@ -48,7 +48,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from tradebot.backtesting.execution import (
+    CostBreakdown,
+    ExecutionAssumptions,
+    ExecutionSimulator,
+    Scenario,
+    scenarios,
+)
 from tradebot.backtesting.metrics import BacktestMetrics, EquityPoint, compute_metrics
+from tradebot.core.clock import SystemClock
 from tradebot.core.config import TunableConfig
 from tradebot.core.logging import get_logger
 from tradebot.core.mathutil import from_bps, round_quantity, safe_div
@@ -62,12 +70,14 @@ from tradebot.core.types import (
     Trade,
     new_id,
 )
+from tradebot.execution.quality import ExecutionQuality, ExecutionRecord
 from tradebot.market.candles import CandleStore
 from tradebot.market.microstructure import CostModel, LiquiditySnapshot
 from tradebot.market.regime import RegimeDetector
 from tradebot.market.scoring import MarketScorer, ScoringInputs
 from tradebot.risk.engine import RiskContext, RiskEngine
-from tradebot.signals.pipeline import SignalPipeline
+from tradebot.signals.pipeline import Opportunity, SignalPipeline
+from tradebot.signals.queue import OpportunityQueue
 from tradebot.strategies.base import MarketView
 from tradebot.strategies.registry import StrategyRegistry
 
@@ -98,6 +108,10 @@ class BacktestResult:
     config_snapshot: dict[str, Any] = field(default_factory=dict)
     start_ms: int = 0
     end_ms: int = 0
+    #: Symbols whose dataset lacked a timeframe the strategies need. Non-empty
+    #: means a low trade count is a DATA problem, not a strategy result.
+    missing_timeframes: dict[str, list[str]] = field(default_factory=dict)
+    liquidations: int = 0
     #: Edge estimates that used an ASSUMED win rate rather than a measured one.
     bootstrap_estimates: int = 0
     bootstrap_strategies: tuple[str, ...] = ()
@@ -176,16 +190,71 @@ class BacktestEngine:
         self.bars_processed = 0
         self._now_ms = 0
 
+        # -- V3 additions, each fixing a BACKTEST_AUDIT.md finding ------------
+        # B-1: the universe is re-ranked every cycle from point-in-time data.
+        self.universe_log: list[dict[str, Any]] = []
+        # B-2: opportunities are scored first and the free slots spent
+        # best-first, exactly as the live engine does.
+        self.queue = OpportunityQueue(
+            ttl_sec=config.opportunity.queue_ttl_sec,
+            max_size=config.opportunity.queue_max_size,
+            clock=SystemClock(),
+        )
+        # B-3: preservation needs a drawdown to act on.
+        self.peak_equity = self.initial_capital
+        self.day_start_equity = self.initial_capital
+        self.realized_pnl_today = 0.0
+        self._day_index = -1
+        # B-5: leverage risk is measured, not assumed away.
+        self.liquidations = 0
+        # B-8 / §35: expected versus actual execution.
+        self.execution_quality = ExecutionQuality(min_samples=10)
+        self.simulator: ExecutionSimulator | None = None
+        self.cost_breakdown = CostBreakdown()
+        self._universe: list[tuple[str, float]] = []
+        self._last_scan_ms = 0
+        #: Symbols whose dataset lacks a timeframe the strategies need. A
+        #: non-empty mapping means "few trades" is a data problem, not a result.
+        self.missing_timeframes: dict[str, list[str]] = {}
+
     # ------------------------------------------------------------------ #
     def run(
-        self, data: dict[str, BacktestData], start_ms: int | None = None, end_ms: int | None = None
+        self,
+        data: dict[str, BacktestData],
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        assumptions: ExecutionAssumptions | None = None,
+        seed: int = 0,
     ) -> BacktestResult:
-        """Replay every bar in chronological order across all symbols."""
+        """Replay every bar in chronological order across all symbols.
+
+        The loop is organised by **timestamp**, not by (timestamp, symbol): the
+        universe has to be ranked and the opportunities compared across symbols
+        before any of them is acted on. Iterating per symbol — as this did
+        before V3 — meant alphabetical order decided who got the last free slot.
+        """
         started = time.time()
         primary = self.config.timeframes.primary
 
-        timeline = self._build_timeline(data, primary, start_ms, end_ms)
-        if not timeline:
+        self.simulator = ExecutionSimulator(
+            assumptions
+            or scenarios(
+                self.config.backtest.spread_bps,
+                self.config.backtest.slippage_bps,
+                self.config.backtest.taker_fee,
+                self.config.backtest.maker_fee,
+            )[Scenario.BASE],
+            seed=seed,
+        )
+
+        scan_interval_ms = self.config.scanner.scan_interval_sec * 1000
+        self._universe = []
+        self._last_scan_ms = -scan_interval_ms
+
+        self._check_timeframe_coverage(data)
+
+        cycles = self._build_timeline(data, primary, start_ms, end_ms)
+        if not cycles:
             log.warning("backtest_no_data")
             return self._result(started, 0, 0)
 
@@ -193,49 +262,99 @@ class BacktestEngine:
         log.info(
             "backtest_starting",
             symbols=len(data),
-            bars=len(timeline),
+            cycles=len(cycles),
             warmup=warmup,
             initial_capital=self.initial_capital,
+            scenario=self.simulator.assumptions.name.value,
+            seed=seed,
         )
 
-        for index, (timestamp, symbol) in enumerate(timeline):
+        for index, (timestamp, symbols) in enumerate(cycles):
             self._now_ms = timestamp
-            entry = data[symbol]
 
-            # Feed every timeframe up to this moment.
-            self._advance(entry, timestamp)
-            self.bars_processed += 1
+            # Feed every timeframe of every symbol up to this moment.
+            for symbol in symbols:
+                self._advance(data[symbol], timestamp)
+                self.bars_processed += 1
 
-            # Manage open positions FIRST: an exit frees budget for an entry,
-            # and processing entries first would let a stale position block one.
+            # Manage open positions FIRST: an exit frees budget an entry may
+            # need, and a stale position left unexamined can block a better one.
             self._manage_positions(data, timestamp)
+            self._roll_day(timestamp)
 
             if index >= warmup:
-                self._consider_entry(entry, timestamp)
+                # The universe is re-ranked on the SCAN interval, not every bar
+                # — matching the live engine, where the scanner runs every
+                # scan_interval_sec and the signal loop works the candidates in
+                # between. Re-ranking every bar would be both slower and a
+                # different system from the one that would be deployed.
+                if timestamp - self._last_scan_ms >= scan_interval_ms:
+                    self._universe = self._rank_universe(data, symbols, timestamp)
+                    self._last_scan_ms = timestamp
+                self._fill_queue(data, self._universe, timestamp)
+                self._spend_slots(data, timestamp)
 
-            if index % 50 == 0 or index == len(timeline) - 1:
-                self._record_equity(data, timestamp)
+            # Every cycle, not every 50 bars: drawdown measured on a sparse
+            # curve misses any drawdown that opens and recovers between samples.
+            self._record_equity(data, timestamp)
 
-        # Close anything still open at the end, at the last known price.
-        self._flatten_all(data, timeline[-1][0])
-        self._record_equity(data, timeline[-1][0])
+        self._flatten_all(data, cycles[-1][0])
+        self._record_equity(data, cycles[-1][0])
 
-        return self._result(started, timeline[0][0], timeline[-1][0])
+        return self._result(started, cycles[0][0], cycles[-1][0])
+
+    def _check_timeframe_coverage(self, data: dict[str, BacktestData]) -> None:
+        """Refuse to run quietly on a dataset the strategies cannot read.
+
+        The strategies are multi-timeframe: momentum, breakout and VWAP read the
+        fast/entry/context series, not just the primary. Given a dataset with
+        only the primary timeframe they all return INSUFFICIENT_DATA, the
+        pipeline rejects every symbol as NO_SIGNAL, and the backtest completes
+        successfully with **zero trades** — a result that looks like "no edge"
+        and is actually "no data". That is the most expensive kind of silent
+        failure a backtest can have, so it is made loud.
+        """
+        required = set(self.config.timeframes.all())
+        missing: dict[str, list[str]] = {}
+        for symbol, entry in data.items():
+            absent = sorted(required - {tf for tf, bars in entry.candles.items() if bars})
+            if absent:
+                missing[symbol] = absent
+
+        if not missing:
+            return
+
+        sample = dict(sorted(missing.items())[:5])
+        log.error(
+            "backtest_dataset_missing_timeframes",
+            symbols_affected=len(missing),
+            required=sorted(required),
+            example=sample,
+            message="strategies that read these timeframes will return "
+            "INSUFFICIENT_DATA and the run will produce few or no trades — "
+            "this is a DATA problem, not a strategy result",
+        )
+        self.missing_timeframes = missing
 
     # ------------------------------------------------------------------ #
     def _build_timeline(
         self, data: dict[str, BacktestData], primary: str, start_ms: int | None, end_ms: int | None
-    ) -> list[tuple[int, str]]:
-        events: list[tuple[int, str]] = []
+    ) -> list[tuple[int, list[str]]]:
+        """Bars grouped by timestamp, chronologically.
+
+        Grouping is what makes cross-symbol ranking possible at all: at a given
+        moment the engine must be able to see every symbol that printed a bar,
+        rank them, and only then decide.
+        """
+        grouped: dict[int, list[str]] = {}
         for symbol, entry in data.items():
             for candle in entry.primary(primary):
                 if start_ms and candle.open_time < start_ms:
                     continue
                 if end_ms and candle.open_time >= end_ms:
                     continue
-                events.append((candle.open_time, symbol))
-        events.sort()
-        return events
+                grouped.setdefault(candle.open_time, []).append(symbol)
+        return [(ts, sorted(symbols)) for ts, symbols in sorted(grouped.items())]
 
     def _advance(self, data: BacktestData, timestamp: int) -> None:
         """Append every bar that has CLOSED by `timestamp`.
@@ -254,20 +373,105 @@ class BacktestEngine:
                 series.append(candle)
 
     # ------------------------------------------------------------------ #
-    def _consider_entry(self, data: BacktestData, timestamp: int) -> None:
+    # Universe -> queue -> slots. The live engine's ordering, reproduced.
+    # ------------------------------------------------------------------ #
+    def _rank_universe(
+        self, data: dict[str, BacktestData], symbols: list[str], timestamp: int
+    ) -> list[tuple[str, float]]:
+        """Rebuild the tradable universe from POINT-IN-TIME information only.
+
+        Every input here comes from bars that have already closed. Nothing reads
+        a future bar, a future ranking or a future volatility — which is the
+        whole reason this is computed per cycle rather than once up front from
+        the full dataset.
+
+        Symbols already held are excluded: they cannot be entered again, and
+        leaving them in would displace a candidate that could be.
+        """
+        scored: list[tuple[str, float]] = []
+        for symbol in symbols:
+            if symbol in self.positions:
+                continue
+            series = self.candles.get(symbol, self.config.timeframes.primary)
+            if series is None or not series.ready(self.regime_detector.min_bars()):
+                continue
+            price = series.last_price
+            if price <= 0:
+                continue
+
+            liquidity = self._liquidity(data[symbol], price)
+            market = self.scorer.score(
+                ScoringInputs(
+                    symbol=symbol,
+                    series=series,
+                    liquidity=liquidity,
+                    funding_rate=self._funding_rate(data[symbol], timestamp),
+                    quote_volume_24h=liquidity.quote_volume_24h,
+                    correlation_penalty=self._correlation_penalty(symbol),
+                    timestamp=timestamp,
+                )
+            )
+            if liquidity.quote_volume_24h < self.config.scanner.min_24h_quote_volume:
+                continue
+            if liquidity.spread_bps > self.config.scanner.max_spread_bps:
+                continue
+            scored.append((symbol, market.total))
+
+        scored.sort(key=lambda item: -item[1])
+        top = scored[: self.config.scanner.top_markets]
+
+        # §8: record WHY each symbol entered the universe, so the ranking can be
+        # audited after the fact rather than taken on trust.
+        for rank, (symbol, score) in enumerate(top, start=1):
+            self.universe_log.append(
+                {
+                    "timestamp": timestamp,
+                    "rank": rank,
+                    "symbol": symbol,
+                    "score": round(score, 3),
+                    "reason": "top_by_market_score",
+                }
+            )
+        return top
+
+    def _correlation_penalty(self, symbol: str) -> float:
+        """How correlated this symbol is with what is already held."""
+        if not self.positions:
+            return 0.0
+        held = {
+            name: (position.direction, position.quantity * position.entry_price)
+            for name, position in self.positions.items()
+        }
+        assessment = self.risk.correlation.assess(symbol, Direction.LONG, 0.0, held)
+        return max(0.0, min(1.0, assessment.portfolio_correlation))
+
+    def _fill_queue(
+        self, data: dict[str, BacktestData], ranked: list[tuple[str, float]], timestamp: int
+    ) -> None:
+        """Evaluate every ranked symbol and queue whatever the pipeline accepts."""
+        self.queue.clear()
+        for symbol, _score in ranked:
+            if symbol not in data:
+                continue
+            opportunity = self._evaluate(data[symbol], timestamp)
+            if opportunity is not None:
+                self.queue.add(opportunity)
+
+    def _evaluate(self, data: BacktestData, timestamp: int) -> Opportunity | None:
+        """Run one symbol through the live analytical pipeline."""
         symbol = data.symbol
         if symbol in self.positions:
-            return
+            return None
 
         primary = self.config.timeframes.primary
         series = self.candles.get(symbol, primary)
         if series is None or not series.ready(self.regime_detector.min_bars()):
-            return
+            return None
 
         regime_state = self.regime_detector.detect(series)
         price = series.last_price
         if price <= 0:
-            return
+            return None
 
         liquidity = self._liquidity(data, price)
         view = MarketView(
@@ -289,36 +493,77 @@ class BacktestEngine:
                 liquidity=liquidity,
                 funding_rate=view.funding_rate,
                 quote_volume_24h=liquidity.quote_volume_24h,
-                correlation_penalty=0.0,
+                correlation_penalty=self._correlation_penalty(symbol),
                 timestamp=timestamp,
             )
         )
 
-        notional_estimate = self.equity * self.config.risk.max_symbol_exposure
         result = self.pipeline.evaluate(
             view,
             market,
             liquidity,
-            notional_estimate,
+            self.equity * self.config.risk.max_symbol_exposure,
+            correlation=self._correlation_penalty(symbol),
+            strategy_allocation=self.risk.strategy_weights(list(self.registry.strategies)),
             seconds_to_funding=self._seconds_to_funding(timestamp),
             now=timestamp / 1000.0,
         )
-        if not result.accepted or result.opportunity is None:
-            return
+        return result.opportunity if result.accepted else None
 
-        context = RiskContext(
-            equity=self.equity,
-            available_balance=self.balance - self._margin_used(),
-            positions=dict(self.positions),
-            prices=self._prices(),
-            symbol_info=data.symbol_info,
-            now=timestamp / 1000.0,
+    def _spend_slots(self, data: dict[str, BacktestData], timestamp: int) -> None:
+        """Offer the best queued opportunities to risk, best first.
+
+        Only as many as there are free slots. Zero free slots means zero offers —
+        never a forced trade.
+        """
+        configured = self.config.risk.max_concurrent_positions
+        allowed = (
+            self.risk.preservation.max_positions(configured)
+            if self.config.preservation.enabled
+            else configured
         )
-        decision = self.risk.evaluate(result.opportunity, context)
-        if not decision.approved or decision.intent is None:
+        free = allowed - len(self.positions)
+        if free <= 0:
             return
 
-        self._open_position(decision.intent, data, timestamp, market.volatility)
+        for entry in self.queue.take(free):
+            opportunity = entry.opportunity
+            symbol = opportunity.symbol
+            if symbol in self.positions or symbol not in data:
+                continue
+
+            context = RiskContext(
+                equity=self.equity,
+                available_balance=self.balance - self._margin_used(),
+                positions=dict(self.positions),
+                prices=self._prices(),
+                symbol_info=data[symbol].symbol_info,
+                realized_pnl_today=self.realized_pnl_today,
+                # B-3: without this the preservation ladder never engages and
+                # the backtest measures a system with the brakes disconnected.
+                drawdown=self._drawdown(),
+                now=timestamp / 1000.0,
+            )
+            decision = self.risk.evaluate(opportunity, context)
+            if not decision.approved or decision.intent is None:
+                continue
+
+            self._open_position(
+                decision.intent, data[symbol], timestamp, opportunity.market.volatility
+            )
+
+    def _drawdown(self) -> float:
+        if self.peak_equity <= 0:
+            return 0.0
+        return max(0.0, (self.peak_equity - self.equity) / self.peak_equity)
+
+    def _roll_day(self, timestamp: int) -> None:
+        """Reset the daily loss counter on the UTC day boundary."""
+        day = timestamp // 86_400_000
+        if day != self._day_index:
+            self._day_index = day
+            self.day_start_equity = self.equity
+            self.realized_pnl_today = 0.0
 
     # ------------------------------------------------------------------ #
     def _open_position(
@@ -329,23 +574,59 @@ class BacktestEngine:
         if fill_price is None:
             return
 
-        cfg = self.config.backtest
-        # Slippage is adverse by construction: a buy fills higher, a sell lower.
-        slippage_fraction = from_bps(cfg.slippage_bps + cfg.spread_bps / 2.0)
-        entry_price = fill_price * (1 + slippage_fraction * intent.direction.sign)
-
         quantity = round_quantity(intent.quantity, data.symbol_info.step_size)
         if quantity <= 0:
             return
+
+        series = self.candles.get(intent.symbol, self.config.timeframes.primary)
+        bar = series.last if series else None
+        liquidity = self._liquidity(data, fill_price)
+
+        simulator = self._require_simulator()
+        fill = simulator.execute(
+            reference_price=fill_price,
+            quantity=quantity,
+            direction=intent.direction,
+            is_entry=True,
+            bar=bar,
+            depth_notional=liquidity.depth_notional,
+        )
+        if not fill.filled:
+            # Rejected outright, or the scenario refused it. The opportunity is
+            # lost — which is exactly what happens live.
+            return
+
+        entry_price = fill.price
+        quantity = fill.quantity
         notional = quantity * entry_price
-        fee = notional * cfg.taker_fee
+        fee = fill.fee
         margin = notional / max(1, intent.leverage)
 
         if margin + fee > self.balance:
             return
 
         self.balance -= fee
-        slippage_cost = abs(entry_price - fill_price) * quantity
+        slippage_cost = fill.slippage_cost
+        self.cost_breakdown.spread_cost += fill.spread_cost
+        self.cost_breakdown.latency_cost += fill.latency_cost
+
+        # §35: what the edge model assumed this leg would cost, versus what it did.
+        self.execution_quality.record(
+            ExecutionRecord(
+                symbol=intent.symbol,
+                direction=intent.direction,
+                order_type="MARKET",
+                is_entry=True,
+                reference_price=fill_price,
+                fill_price=entry_price,
+                quantity=quantity,
+                expected_cost=from_bps(
+                    self.config.backtest.slippage_bps + self.config.backtest.spread_bps / 2.0
+                ),
+                latency_ms=simulator.assumptions.latency_ms,
+                at_ms=timestamp,
+            )
+        )
 
         position = Position(
             position_id=new_id("bt_"),
@@ -399,6 +680,22 @@ class BacktestEngine:
         self, position: Position, bar: Candle, timestamp: int
     ) -> tuple[ExitReason | None, float]:
         """Decide whether this bar closes the position, pessimistically."""
+        # Liquidation first: the exchange does not wait for our stop.
+        liquidation = self._liquidation_price(position)
+        if liquidation > 0 and (
+            (position.direction is Direction.LONG and bar.low <= liquidation)
+            or (position.direction is Direction.SHORT and bar.high >= liquidation)
+        ):
+            self.liquidations += 1
+            log.warning(
+                "backtest_liquidation",
+                symbol=position.symbol,
+                entry=position.entry_price,
+                liquidation=liquidation,
+                leverage=position.leverage,
+            )
+            return ExitReason.LIQUIDATION, liquidation
+
         stop_hit = position.is_stop_hit(bar.low, bar.high)
         target_hit = position.is_target_hit(bar.low, bar.high)
 
@@ -418,6 +715,21 @@ class BacktestEngine:
             return ExitReason.TIME_LIMIT, bar.close
 
         return None, 0.0
+
+    def _liquidation_price(self, position: Position) -> float:
+        """Where this position is force-closed.
+
+        A simplified isolated-margin model: the position is liquidated once the
+        loss consumes the posted margin less the maintenance requirement. It is
+        approximate — real maintenance margin is tiered by notional — but the
+        point is that leverage risk is MEASURED rather than assumed away. The
+        risk engine refuses entries whose liquidation sits too close; whether it
+        succeeds is exactly what a backtest is supposed to test.
+        """
+        maintenance = 0.004  # 0.4%, Binance's lowest tier
+        leverage = max(1, position.leverage)
+        move = (1.0 / leverage) - maintenance
+        return position.entry_price * (1.0 - move * position.direction.sign)
 
     @staticmethod
     def _stop_fill(position: Position, bar: Candle) -> float:
@@ -489,19 +801,45 @@ class BacktestEngine:
         timestamp: int,
         data: BacktestData,
     ) -> None:
-        cfg = self.config.backtest
-        # Exits are marketable too, so they pay slippage in the adverse direction.
-        slippage_fraction = from_bps(cfg.slippage_bps + cfg.spread_bps / 2.0)
-        filled = exit_price * (1 - slippage_fraction * position.direction.sign)
-        slippage_cost = abs(filled - exit_price) * position.quantity
+        series = self.candles.get(position.symbol, self.config.timeframes.primary)
+        bar = series.last if series else None
+        liquidity = self._liquidity(data, exit_price)
+
+        simulator = self._require_simulator()
+        # A stop, a liquidation or the time cap is not optional: a reduce-only
+        # market order in a liquid perpetual gets done. Modelling an un-exitable
+        # position would understate risk in the one direction that matters.
+        urgent = reason in {
+            ExitReason.STOP_LOSS,
+            ExitReason.LIQUIDATION,
+            ExitReason.TIME_LIMIT,
+            ExitReason.RISK_EVENT,
+        }
+        fill = simulator.execute(
+            reference_price=exit_price,
+            quantity=position.quantity,
+            direction=position.direction,
+            is_entry=False,
+            bar=bar,
+            depth_notional=liquidity.depth_notional,
+            is_exit_urgent=urgent,
+        )
+        filled = fill.price if fill.filled else exit_price
+        slippage_cost = fill.slippage_cost
+        self.cost_breakdown.spread_cost += fill.spread_cost
+        self.cost_breakdown.latency_cost += fill.latency_cost
 
         gross = (filled - position.entry_price) * position.quantity * position.direction.sign
-        exit_fee = filled * position.quantity * cfg.taker_fee
+        exit_fee = (
+            fill.fee if fill.filled else filled * position.quantity * self.config.backtest.taker_fee
+        )
         fees = position.entry_fee + exit_fee
         net = gross - fees - position.funding_paid
 
         self.balance += net
         self.equity = self.balance
+        self.realized_pnl_today += net
+        self.peak_equity = max(self.peak_equity, self.equity)
 
         trade = Trade(
             trade_id=new_id("t_"),
@@ -530,7 +868,23 @@ class BacktestEngine:
             initial_risk=position.initial_risk,
         )
         self.trades.append(trade)
+        self.cost_breakdown.add_trade(trade)
         del self.positions[position.symbol]
+
+        self.execution_quality.record(
+            ExecutionRecord(
+                symbol=position.symbol,
+                direction=position.direction,
+                order_type="MARKET",
+                is_entry=False,
+                reference_price=exit_price,
+                fill_price=filled,
+                quantity=position.quantity,
+                expected_cost=self.config.backtest.taker_fee,
+                latency_ms=simulator.assumptions.latency_ms,
+                at_ms=timestamp,
+            )
+        )
 
         # Feed the result back so cooldowns, allocation and the strategy kill
         # switch behave exactly as they would live.
@@ -541,6 +895,10 @@ class BacktestEngine:
             r_multiple=trade.r_multiple,
             volatility=position.metadata.get("volatility", 0.0),
             reason=reason.value,
+            # B-4: without these the strategy x regime matrix records every
+            # trade as SIDEWAYS with zero PnL, and looks like a real result.
+            regime=position.regime,
+            pnl=net,
         )
         self.pipeline.edge_calculator.record_result(
             position.strategy,
@@ -574,7 +932,11 @@ class BacktestEngine:
         series = self.candles.get(data.symbol, self.config.timeframes.primary)
         quote_volume = 0.0
         if series is not None and len(series) >= 20:
-            quote_volume = float(series.quote_volumes[-20:].mean()) * 288
+            # B-9: bars per day is derived from the timeframe, not hardcoded to
+            # 288. The old constant was right only for 5m bars and understated
+            # volume 5x on 1m data, which feeds both the market score and the
+            # slippage model.
+            quote_volume = float(series.quote_volumes[-20:].mean()) * self._bars_per_day()
         depth = max(quote_volume * 0.001, 1000.0)
         return LiquiditySnapshot(
             symbol=data.symbol,
@@ -584,6 +946,29 @@ class BacktestEngine:
             book_imbalance=0.0,
             quote_volume_24h=quote_volume,
         )
+
+    def _require_simulator(self) -> ExecutionSimulator:
+        """The simulator, or a clear error rather than an AttributeError.
+
+        `run()` always creates one, so this cannot fire in normal use — but an
+        `assert` here would be stripped by `python -O` and reappear as an
+        AttributeError in production and nowhere else.
+        """
+        if self.simulator is None:
+            raise RuntimeError(
+                "the execution simulator is not initialised; call run() rather "
+                "than driving the engine's internals directly"
+            )
+        return self.simulator
+
+    def _bars_per_day(self) -> float:
+        from tradebot.core.types import Timeframe
+
+        try:
+            seconds = Timeframe(self.config.timeframes.primary).seconds
+        except ValueError:
+            seconds = 300
+        return 86_400.0 / max(1, seconds)
 
     def _funding_rate(self, data: BacktestData, timestamp: int) -> float:
         if not data.funding_rates:
@@ -648,6 +1033,8 @@ class BacktestEngine:
             },
             start_ms=start_ms,
             end_ms=end_ms,
+            missing_timeframes=dict(self.missing_timeframes),
+            liquidations=self.liquidations,
             bootstrap_estimates=self.pipeline.edge_calculator.bootstrap_estimates,
             bootstrap_strategies=tuple(sorted(self.pipeline.edge_calculator.bootstrap_strategies)),
             strategy_stats=self.pipeline.edge_calculator.export_stats(),

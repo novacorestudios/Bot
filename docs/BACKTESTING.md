@@ -8,21 +8,29 @@
 ## Getting data
 
 ```bash
-python scripts/download_data.py --top 30 \
-    --timeframes 1m,3m,5m,15m,1h \
+python scripts/fetch_data.py --top 30 \
+    --intervals 1m,3m,5m,15m,1h \
     --start 2024-01-01 --end 2024-07-01 \
-    --out data/klines
+    --out data
 ```
 
-Six months across thirty symbols is a reasonable minimum. Binance also
-publishes bulk archives at <https://data.binance.vision> which are far faster
-for multi-year downloads.
+Six months across thirty symbols is a reasonable minimum. The default source is
+the bulk archive at <https://data.binance.vision>, which needs no credentials
+and is roughly 30x fewer requests than REST for a long range.
 
-The loader validates as it reads and **refuses** rather than repairs:
-out-of-order bars, duplicates, impossible OHLC relationships, and gaps beyond a
-tolerance. Indicators computed across a silent gap read the resulting price jump
-as a real move, which is the kind of error that produces a confident, precise,
-wrong answer.
+**Fetch every timeframe the strategies read.** They are multi-timeframe, and a
+dataset with only the primary produces zero trades that look like "no edge" —
+see *A dataset that produces no trades* below.
+
+See [`DATA_PIPELINE.md`](../DATA_PIPELINE.md) for the storage layout, the
+manifests, and the biases (survivorship, listing boundaries) stated as biases.
+
+The loader validates as it reads and **refuses** rather than repairs
+out-of-order bars, impossible OHLC relationships and non-positive prices;
+duplicates are dropped losslessly and recorded in the manifest, and gaps are
+measured and reported rather than filled. Indicators computed across a silent
+gap read the resulting price jump as a real move, which is the kind of error
+that produces a confident, precise, wrong answer.
 
 ## Running
 
@@ -67,14 +75,85 @@ full risk budget and every kill switch.
 
 ## What is NOT simulated
 
-Stated plainly, because these are the gaps between a backtest and reality — and
-**every one of them makes the backtest more optimistic**:
+Stated plainly, because these are the gaps between a backtest and reality and
+every one of them makes the backtest **more optimistic**:
 
-- **Order-book depth.** Slippage is parametric; kline data contains no book.
-- **Partial fills on entry.** Entries fill completely or not at all.
-- **Latency** beyond the next-bar fill rule.
-- **Exchange outages, rate limiting and order rejections.**
-- **Market impact.** Negligible at 75 USDT, false at scale.
+* **Order-book depth.** Slippage is modelled parametrically from size and the
+  bar's own range, not by walking a historical book — kline data contains no
+  book at all. This is the largest single limitation, and it is why the three
+  scenarios exist.
+* **Historical spreads.** Binance does not publish bookTicker history at a
+  volume or completeness worth relying on, so the spread is an assumption. For
+  a scalper, spread is most of the cost, so an assumed spread is an assumed
+  answer to the central question. Read the STRESS column accordingly.
+* **Market impact beyond the modelled participation term.** Negligible at
+  75 USDT, false at scale.
+* **Exchange outages and rate limiting.** Rejections are modelled statistically
+  in CONSERVATIVE and STRESS, not causally.
+* **Maker fills.** Every fill is taker, matching the shipped `entry_order_type:
+  MARKET`. A maker strategy would be a different system.
+
+## Execution scenarios
+
+Since V3 the same signals are executed under three sets of assumptions, and all
+three are reported side by side. They are **not** three guesses at the truth;
+they are a sensitivity test on the part of the model that is assumed rather
+than measured.
+
+| | spread | slippage | latency | rejects | partial fills |
+|---|---|---|---|---|---|
+| `BASE` | configured | size-aware | 250 ms | none | none |
+| `CONSERVATIVE` | 2x | 2x + volatility | 750 ms | 1% | 5% at 60% |
+| `STRESS` | 4x | 4x + volatility | 2500 ms | 5% | 15% at 40% |
+
+**A strategy profitable under BASE and destroyed under CONSERVATIVE has an edge
+thinner than the error bars on the cost model**, which is the same thing as
+having no edge you can rely on. `ScenarioResults.survives_stress` asks that
+question directly.
+
+Reporting one scenario without the others is the easiest way to fabricate an
+edge, so `run_scenarios()` returns all three and the API offers no way to
+produce a single-scenario report.
+
+### Latency
+
+Bar data cannot resolve sub-bar timing, so latency is applied as an adverse
+price adjustment proportional to the bar's own realised range: a fill delayed
+into a fast market is worse than one delayed into a quiet one, and the bar's
+range is the only evidence about speed that kline data holds. This is a model,
+not a measurement.
+
+### Liquidation
+
+Modelled since V3, checked before the stop on every bar — the exchange does not
+wait for our stop. The maintenance-margin model is simplified (a flat 0.4%
+rather than Binance's notional tiers), but the point is that leverage risk is
+**measured** rather than assumed away by the risk engine's entry check.
+
+## Reproducibility
+
+Every run carries a `RunContext`: run ID, git commit, config hash, dataset
+fingerprint, seed and code version. The config hash covers the *whole* validated
+config rather than a chosen subset, because the parameter someone forgot to
+include is exactly the one that will differ between two runs meant to match.
+The dataset fingerprint is order-independent and is taken over bar values, not
+file bytes.
+
+A result quoted without its run ID cannot be reproduced or compared, and is
+therefore not evidence.
+
+## A dataset that produces no trades
+
+The strategies are multi-timeframe: momentum, breakout and VWAP read the fast,
+entry and context series, not just the primary. Given a dataset with only the
+primary timeframe they all return `INSUFFICIENT_DATA`, the pipeline rejects
+every symbol as `NO_SIGNAL`, and the backtest completes successfully with
+**zero trades** — a result that reads as "no edge" and actually means "no data".
+
+The engine now checks timeframe coverage on startup and logs an error naming
+the missing series; `BacktestResult.missing_timeframes` carries it too. If that
+field is non-empty, a low trade count is a data problem and the run should not
+be interpreted.
 
 ## The bootstrap problem
 

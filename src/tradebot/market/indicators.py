@@ -234,6 +234,22 @@ def atr_percent(high: Array, low: Array, close: Array, period: int = 14) -> Arra
         return np.where(c > 0, a / c, np.nan)
 
 
+def _rolling(arr: Array, period: int) -> Array:
+    """A read-only stacked view of every length-``period`` window.
+
+    A strided view rather than a Python loop over slices. The loop form called
+    numpy once per bar on a 20-element window, which is the worst possible
+    ratio of dispatch overhead to arithmetic — it dominated the backtest at
+    ~1.8M calls for three symbols over 500 bars, and made a realistic run
+    impractical rather than merely slow.
+
+    Results are bit-identical to the loop: same windows, same reduction.
+    """
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    return sliding_window_view(arr, period)
+
+
 def bollinger(
     values: Array | list[float], period: int = 20, num_std: float = 2.0
 ) -> tuple[Array, Array, Array]:
@@ -241,8 +257,8 @@ def bollinger(
     arr = _as_array(values)
     middle = sma(arr, period)
     std = _empty_like(arr)
-    for i in range(period - 1, arr.size):
-        std[i] = float(np.std(arr[i - period + 1 : i + 1]))
+    if arr.size >= period:
+        std[period - 1 :] = _rolling(arr, period).std(axis=1)
     return middle + num_std * std, middle, middle - num_std * std
 
 
@@ -402,22 +418,28 @@ def volume_ratio(volume: Array | list[float], period: int = 20) -> Array:
     out = _empty_like(v)
     if period < 1 or v.size <= period:
         return out
-    for i in range(period, v.size):
-        baseline = float(np.mean(v[i - period : i]))
-        if baseline > 0:
-            out[i] = v[i] / baseline
+    baselines = _rolling(v[:-1], period)[: v.size - period].mean(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out[period:] = np.where(baselines > 0, v[period:] / baselines, np.nan)
     return out
 
 
 def volume_zscore(volume: Array | list[float], period: int = 30) -> Array:
-    """How unusual the current volume is, in standard deviations."""
+    """How unusual the current volume is, in standard deviations.
+
+    The window EXCLUDES the current bar, so a spike is measured against the
+    baseline before it rather than against a baseline it is itself inflating.
+    """
     v = _as_array(volume)
     out = _empty_like(v)
-    for i in range(period, v.size):
-        window = v[i - period : i]
-        std = float(np.std(window))
-        if std > 0:
-            out[i] = (v[i] - float(np.mean(window))) / std
+    if v.size <= period:
+        return out
+    windows = _rolling(v[:-1], period)[: v.size - period]
+    means = windows.mean(axis=1)
+    stds = windows.std(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scores = np.where(stds > 0, (v[period:] - means) / stds, np.nan)
+    out[period:] = scores
     return out
 
 
