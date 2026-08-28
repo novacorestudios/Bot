@@ -676,22 +676,26 @@ class TestIssue2CLIUsesTheScenarioRunner:
         assert "BacktestEngine" not in calls, "the CLI still runs a single engine"
 
     def test_the_cli_evaluates_trust_before_running(self) -> None:
-        from tradebot.app.commands import run_backtest
+        """V3.2 moved the gate into the shared `_load_and_trust` helper so that
+        `walkforward` goes through the same rules. The ordering this test was
+        written for is unchanged: nothing runs before trust is decided."""
+        from tradebot.app.commands import _load_and_trust, run_backtest
 
         source = inspect.getsource(run_backtest)
-        assert "evaluate_trust" in source
+        assert "_load_and_trust(" in source
         # Compare CALL sites, not the import block at the top.
-        assert source.index("evaluate_trust(") < source.index("run_scenarios(")
+        assert source.index("_load_and_trust(") < source.index("run_scenarios(")
+        assert "evaluate_trust(" in inspect.getsource(_load_and_trust)
 
     def test_the_cli_refuses_when_trust_says_so(self) -> None:
-        from tradebot.app.commands import run_backtest
+        from tradebot.app.commands import _load_and_trust
 
-        assert "trust.may_run" in inspect.getsource(run_backtest)
+        assert "trust.may_run" in inspect.getsource(_load_and_trust)
 
     def test_the_cli_loads_stored_exchange_info(self) -> None:
-        from tradebot.app.commands import run_backtest
+        from tradebot.app.commands import _load_and_trust
 
-        assert "load_exchange_info" in inspect.getsource(run_backtest)
+        assert "load_exchange_info" in inspect.getsource(_load_and_trust)
 
     def test_the_cli_offers_strict_oos(self) -> None:
         from tradebot.app.cli import build_parser
@@ -718,8 +722,10 @@ class TestArgumentsAreValidatedBeforeWork:
         from tradebot.app.commands import run_backtest
 
         source = inspect.getsource(run_backtest)
-        assert source.index("_parse_date(args.split)") < source.index("load_dataset(")
-        assert source.index("_parse_date(args.start)") < source.index("load_dataset(")
+        # The load itself moved into `_load_and_trust` in V3.2; the property
+        # under test is the same one — no date is parsed after work has begun.
+        assert source.index("_parse_date(args.split)") < source.index("_load_and_trust(")
+        assert source.index("_parse_date(args.start)") < source.index("_load_and_trust(")
 
     def test_the_iso_t_separator_is_accepted(self) -> None:
         """It is what every other tool prints."""

@@ -149,3 +149,33 @@ engineering in this environment will take it.
 
 If the eventual answer is that there is no edge, **the correct action is not to
 trade.** That would be a successful use of this system, not a failed one.
+
+---
+
+## V3.2 — readiness after the trust and timing patch
+
+### What moved
+
+| area | before V3.2 | after |
+| --- | --- | --- |
+| data trust | corrupt data reported TRUSTED | UNUSABLE data is REFUSED, and no flag overrides it |
+| walk-forward | no trust check at all | the same gate, the same implementation |
+| `opened_at` | the signal timestamp | the fill timestamp |
+| max-hold cap | measured from the signal, closing early | measured from the fill |
+| funding timing | an assumed 8-hour grid | the symbol's actual event times |
+| walk-forward config | seed 0, implicit scenario | seed and scenario explicit and recorded |
+| data provenance | nothing written per run | `<report>.data_quality.json` per run |
+
+### What this does and does not license
+
+It licenses **believing the measurement apparatus**. A `TRUSTED` banner now
+means the bars were checked and passed; a duration now means time in the
+market; a funding cost now comes from real events.
+
+It does **not** license live capital. Nothing here measured profitability, and
+the correctness of a measuring instrument is not evidence about what it will
+measure. The gate to live trading is unchanged and unmet: a real backtest on
+real Binance history, then walk-forward consistency, then paper trading that
+matches the backtest's own execution assumptions.
+
+**Status: ENGINEERING / CORRECTNESS VERIFIED. PROFITABILITY NOT MEASURED.**

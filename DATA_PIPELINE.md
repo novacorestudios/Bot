@@ -222,3 +222,58 @@ and nothing was written.
 
 **No real Binance data has been downloaded, and no backtest on real data has
 been run, from this environment.**
+
+---
+
+## V3.2 — the quality artifact and the shared status vocabulary
+
+### One vocabulary, two producers
+
+`QualityStatus` (`OK` / `DEGRADED` / `UNUSABLE`) is now the *only* grading in
+the project. Both quality producers speak it:
+
+* `tradebot.data.validation.ValidationReport` — acquisition time, from
+  `scripts/fetch_data.py`.
+* `tradebot.backtesting.data.DataQuality` — load time, from `load_dataset()`.
+
+Both satisfy the `DatasetQuality` protocol in `backtesting/trust.py`, which is
+what the trust gate consumes. Before V3.2 the gate read three attributes
+`DataQuality` did not have, so the checks silently did nothing; the protocol
+makes the next such drift a type error.
+
+### What makes a series UNUSABLE rather than DEGRADED
+
+| condition | status |
+| --- | --- |
+| impossible OHLC — `high < low`, or `open`/`close` outside the bar's range | UNUSABLE |
+| a price at or below zero on any of the four legs | UNUSABLE |
+| negative volume | UNUSABLE |
+| rows out of chronological order | UNUSABLE |
+| a gap larger than the tolerance (`max_gap_bars`, default 10) | UNUSABLE |
+| no rows | UNUSABLE |
+| duplicate timestamps — dropped, but the file was wrong | DEGRADED |
+| a gap within tolerance | DEGRADED |
+| none of the above | OK |
+
+Nothing is repaired by interpolation. A synthesised bar is a fabricated price.
+
+### The per-run quality artifact
+
+Every `backtest` and `walkforward` run writes `<report>.data_quality.json`
+beside its report:
+
+```json
+{
+  "dataset": "data",
+  "trust": {"level": "TRUSTED", "blockers": [], "downgrades": [], "overrides": []},
+  "rows": [
+    {"SYMBOL": "BTCUSDT", "INTERVAL": "1m", "START": 1704067200000,
+     "END": 1704153599999, "ROWS": 1440, "MISSING": 0, "DUPLICATES": 0,
+     "GAPS": 0, "COVERAGE": 1.0, "QUALITY_STATUS": "OK"}
+  ],
+  "detail": []
+}
+```
+
+It is written **before** the refusal check, so a refused run still leaves the
+evidence of why it was refused.

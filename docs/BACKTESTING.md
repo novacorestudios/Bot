@@ -406,3 +406,71 @@ From `IMPLEMENTATION_PLAN.md` §9. A backtest alone satisfies none of them:
 5. ≥ 14 days of paper trading with metrics inside the backtest's confidence band
 
 A strategy that passes the backtest and fails any of these is not ready.
+
+---
+
+## V3.2 — trust and timing
+
+### The trust gate decides before the run, and nothing bypasses it
+
+Both `tradebot backtest` and `tradebot walkforward` load through one
+`_load_and_trust()` helper. There is exactly one implementation of the rules and
+both commands are subject to it; before V3.2 `walkforward` had no trust check at
+all and would happily analyse a dataset `backtest` had refused.
+
+| condition | without `--allow-degraded` | with it |
+| --- | --- | --- |
+| no symbols loaded | REFUSED | REFUSED |
+| a structurally corrupt series | REFUSED | REFUSED |
+| a required timeframe absent | REFUSED | REFUSED |
+| a series with gaps or duplicates | REFUSED | UNTRUSTED |
+| no exchangeInfo | UNTRUSTED | UNTRUSTED |
+| funding enabled, no funding history | UNTRUSTED | UNTRUSTED |
+| clean | TRUSTED | TRUSTED |
+
+`--allow-degraded` acknowledges gaps. It **cannot** rescue corrupt data, and
+nothing moves any condition to TRUSTED.
+
+### Three timestamps, and which one `opened_at` is
+
+```
+   bar closes            order sent          next bar opens
+        |                     |                     |
+    signal_at    ========    order_at    ========   filled_at == opened_at
+```
+
+* **`signal_at`** — the decision point. Every bar the strategies read had
+  already closed, which is what keeps the decision free of look-ahead.
+* **`order_at`** — submission. Equal to `signal_at` in the backtest; the
+  simulator's latency assumption is priced into the fill, not the clock.
+* **`filled_at`** — the open of the next decision bar. **This is
+  `Position.opened_at` and `Trade.opened_at`.**
+
+So `duration_sec` is time exposed to the market, the 3600-second maximum-hold
+cap counts from the fill, and funding is charged only for events strictly inside
+the position's life. `Trade.signal_to_fill_sec` reports the delay; `0.0` there
+means the timeline was not recorded, not that the fill was instant.
+
+### Funding timing comes from the data, never from a schedule
+
+`data.funding_rates` is the single source of truth for funding-rate display,
+seconds-to-funding, expected cost and the charge itself. The rate at a moment is
+the most recently settled event at or before it; seconds-to-funding counts to
+the actual next event.
+
+When no event follows — no funding history was loaded, or the data ends first —
+`seconds_to_funding` is **infinity**, which the edge model reads as "no funding
+falls inside the expected hold". Nothing is fabricated to fill the hole, and the
+trust gate downgrades the run to UNTRUSTED so the gap is never silent.
+
+### Walk-forward versus the headline backtest
+
+Identical, because both reach it through one `TunableConfig` and one
+`BacktestEngine`: fees, spread, slippage, latency, rejection and partial-fill
+behaviour, funding, risk sizing, maximum concurrent positions, leverage, the
+maximum-hold cap, and the strategy set. Capital and seed are passed explicitly
+and recorded in the report.
+
+Intentionally different: walk-forward runs **one** scenario per fold, not three.
+It is measuring consistency across time; scenario sensitivity is what `backtest`
+measures. The scenario is named in the report.

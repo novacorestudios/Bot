@@ -24,13 +24,49 @@ The distinction that matters is between *missing* and *damaged*:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from tradebot.core.logging import get_logger
+from tradebot.data.validation import QualityStatus
 
 log = get_logger(__name__)
+
+
+@runtime_checkable
+class DatasetQuality(Protocol):
+    """What the trust gate needs to know about one symbol/interval series.
+
+    This is the **one** contract, and it is a Protocol on purpose. Two classes
+    implement it — :class:`tradebot.backtesting.data.DataQuality` (load time)
+    and :class:`tradebot.data.validation.ValidationReport` (acquisition time) —
+    and the gate treats them identically.
+
+    Before V3.2 there was no contract. The gate read ``status``, ``interval``
+    and ``missing_bars`` off whatever it was handed, through
+    ``getattr(q, "status", None)``. The loader's ``DataQuality`` had none of
+    those attributes, so every guard evaluated to ``False``, and a series with
+    impossible OHLC and a 500-bar hole was reported ``TRUSTED``. Typing the
+    parameter turns that class of mistake into a mypy error instead of a
+    confident wrong number.
+    """
+
+    @property
+    def symbol(self) -> str: ...
+
+    @property
+    def interval(self) -> str: ...
+
+    @property
+    def missing_bars(self) -> int: ...
+
+    @property
+    def status(self) -> QualityStatus: ...
+
+    @property
+    def usable(self) -> bool: ...
 
 
 class TrustLevel(StrEnum):
@@ -93,7 +129,7 @@ class TrustReport:
 
 def evaluate_trust(
     data: dict[str, Any],
-    quality: list[Any],
+    quality: Sequence[DatasetQuality],
     required_timeframes: list[str],
     funding_enabled: bool,
     have_exchange_info: bool,
@@ -101,9 +137,27 @@ def evaluate_trust(
 ) -> TrustReport:
     """Decide whether this dataset may be believed.
 
-    ``allow_degraded`` is the explicit override the brief asks for: it lets a
-    run proceed on gappy data, and forces the result to UNTRUSTED so nobody can
-    quote it as a result.
+    The decision table, in full:
+
+    ==========================================  ===================  ==========
+    condition                                   without the flag     with it
+    ==========================================  ===================  ==========
+    no symbols loaded                           REFUSED              REFUSED
+    UNUSABLE series (structural corruption)     REFUSED              REFUSED
+    a required timeframe is absent              REFUSED              REFUSED
+    DEGRADED series (gaps, duplicates)          REFUSED              UNTRUSTED
+    no exchangeInfo                             UNTRUSTED            UNTRUSTED
+    funding enabled, no funding history         UNTRUSTED            UNTRUSTED
+    everything present and clean                TRUSTED              TRUSTED
+    ==========================================  ===================  ==========
+
+    Two properties hold by construction, and both are tested:
+
+    * ``--allow-degraded`` cannot rescue structurally corrupt data. Before V3.2
+      it could, which meant one flag turned a refusal into a running backtest
+      over bars with impossible OHLC.
+    * **No input condition produces TRUSTED except a clean one.** An override
+      can only move REFUSED to UNTRUSTED; nothing moves anything to TRUSTED.
     """
     report = TrustReport()
 
@@ -111,16 +165,14 @@ def evaluate_trust(
         report.block("no symbols loaded")
         return report
 
-    # -- damaged data: refused ------------------------------------------- #
-    unusable = [q for q in quality if getattr(q, "status", None) and not q.usable]
+    # -- damaged data: refused, and no flag overrides this ---------------- #
+    unusable = [q for q in quality if q.status is QualityStatus.UNUSABLE]
     if unusable:
         names = ", ".join(f"{q.symbol}/{q.interval}" for q in unusable[:5])
-        message = f"{len(unusable)} dataset(s) failed validation ({names})"
-        if allow_degraded:
-            report.overrides.append(f"{message} — allowed by --allow-degraded")
-            report.downgrade(message)
-        else:
-            report.block(message)
+        report.block(
+            f"{len(unusable)} dataset(s) are structurally corrupt ({names}) — "
+            f"there is no honest way to backtest on them"
+        )
 
     # -- missing timeframes: refused, because the run is meaningless ------ #
     missing_tf: dict[str, list[str]] = {}
@@ -136,15 +188,20 @@ def evaluate_trust(
             f"read ({sample}) — a low trade count would mean NO DATA, not NO EDGE"
         )
 
-    # -- degraded data: usable, but the result is not evidence ------------ #
-    degraded = [
-        q
-        for q in quality
-        if getattr(q, "status", None) and q.usable and str(q.status) == "DEGRADED"
-    ]
+    # -- degraded data: runs only when the operator says so --------------- #
+    degraded = [q for q in quality if q.status is QualityStatus.DEGRADED]
     if degraded:
-        total_missing = sum(getattr(q, "missing_bars", 0) for q in degraded)
-        report.downgrade(f"{len(degraded)} dataset(s) have gaps ({total_missing} bars missing)")
+        total_missing = sum(q.missing_bars for q in degraded)
+        names = ", ".join(f"{q.symbol}/{q.interval}" for q in degraded[:5])
+        message = (
+            f"{len(degraded)} dataset(s) are DEGRADED ({names}); "
+            f"{total_missing} bar(s) missing in total"
+        )
+        if allow_degraded:
+            report.overrides.append(f"{message} — accepted via --allow-degraded")
+            report.downgrade(message)
+        else:
+            report.block(f"{message}. Re-run with --allow-degraded to proceed as UNTRUSTED")
 
     # -- missing metadata: downgrade -------------------------------------- #
     if not have_exchange_info:

@@ -45,6 +45,7 @@ Every one of these makes a backtest more optimistic than reality.
 from __future__ import annotations
 
 import time
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -216,6 +217,7 @@ class BacktestEngine:
         self.cost_breakdown = CostBreakdown()
         self._universe: list[tuple[str, float]] = []
         self._last_scan_ms = 0
+        self._funding_times: dict[str, list[int]] = {}
         #: Symbols whose dataset lacks a timeframe the strategies need. A
         #: non-empty mapping means "few trades" is a data problem, not a result.
         self.missing_timeframes: dict[str, list[str]] = {}
@@ -549,7 +551,7 @@ class BacktestEngine:
             self.equity * self.config.risk.max_symbol_exposure,
             correlation=self._correlation_penalty(symbol),
             strategy_allocation=self.risk.strategy_weights(list(self.registry.strategies)),
-            seconds_to_funding=self._seconds_to_funding(timestamp),
+            seconds_to_funding=self._seconds_to_funding(data, timestamp),
             now=timestamp / 1000.0,
         )
         return result.opportunity if result.accepted else None
@@ -613,10 +615,27 @@ class BacktestEngine:
     def _open_position(
         self, intent: OrderIntent, data: BacktestData, timestamp: int, volatility: float
     ) -> None:
-        """Fill at the NEXT bar's open — never at the close that produced the signal."""
-        fill_price = self._next_open(data, timestamp)
-        if fill_price is None:
+        """Fill at the NEXT bar's open — never at the close that produced the signal.
+
+        Three distinct moments, and they are not interchangeable:
+
+        ``signal_at``
+            The decision point. Every bar the strategies read had already closed
+            by then, which is what keeps the decision free of look-ahead.
+        ``order_at``
+            When the order was submitted. In the backtest this is the same
+            instant as the signal — there is no queueing delay to model beyond
+            the simulator's own latency assumption, which is priced into the
+            fill rather than the clock.
+        ``filled_at``
+            When the fill actually happened: the open of the next decision bar.
+            This is what ``Position.opened_at`` carries, so duration, the
+            maximum-hold cap and funding eligibility all measure from the fill.
+        """
+        fill_target = self._next_fill(data, timestamp)
+        if fill_target is None:
             return
+        filled_at, fill_price = fill_target
 
         quantity = round_quantity(intent.quantity, data.symbol_info.step_size)
         if quantity <= 0:
@@ -683,7 +702,10 @@ class BacktestEngine:
             take_profit=intent.take_profit,
             strategy=intent.strategy,
             regime=intent.regime,
-            opened_at=timestamp,
+            # opened_at IS filled_at. Never the signal timestamp.
+            opened_at=filled_at,
+            signal_at=timestamp,
+            order_at=timestamp,
             entry_notional=notional,
             entry_fee=fee,
             entry_slippage=slippage_cost,
@@ -975,6 +997,8 @@ class BacktestEngine:
             stop_loss=position.initial_stop,
             take_profit=position.take_profit,
             opened_at=position.opened_at,
+            signal_at=position.signal_at,
+            order_at=position.order_at,
             closed_at=timestamp,
             gross_pnl=gross,
             fees=fees,
@@ -1053,16 +1077,22 @@ class BacktestEngine:
                 self._close_position(position, price, ExitReason.MANUAL, timestamp, entry)
 
     # ------------------------------------------------------------------ #
-    def _next_open(self, data: BacktestData, timestamp: int) -> float | None:
-        """The open of the first DECISION bar starting after `timestamp`.
+    def _next_fill(self, data: BacktestData, timestamp: int) -> tuple[int, float] | None:
+        """``(filled_at, fill_price)`` for the first DECISION bar after `timestamp`.
 
         Uses the decision interval, not the strategies' primary: filling a
         1-minute decision at the next 5-minute open would impose four minutes of
         delay the live system does not have.
+
+        Returning the bar's ``open_time`` alongside its open is the whole point.
+        The fill happens at a different moment from the signal, and until V3.2
+        the engine filled at this bar's price while stamping the position with
+        the *signal* timestamp — so every position appeared to have been opened
+        one decision interval before it actually was.
         """
         for candle in data.primary(self.decision_interval):
             if candle.open_time > timestamp:
-                return candle.open
+                return candle.open_time, candle.open
         return None
 
     def _liquidity(self, data: BacktestData, price: float) -> LiquiditySnapshot:
@@ -1108,16 +1138,58 @@ class BacktestEngine:
             seconds = 300
         return 86_400.0 / max(1, seconds)
 
-    def _funding_rate(self, data: BacktestData, timestamp: int) -> float:
-        if not data.funding_rates:
-            return 0.0
-        interval = self.config.edge.funding_interval_hours * 3_600_000
-        bucket = (timestamp // interval) * interval
-        return data.funding_rates.get(bucket, 0.0)
+    def _funding_schedule(self, data: BacktestData) -> list[int]:
+        """The symbol's actual funding event times, ascending. Cached.
 
-    def _seconds_to_funding(self, timestamp: int) -> float:
-        interval_ms = self.config.edge.funding_interval_hours * 3_600_000
-        return (interval_ms - (timestamp % interval_ms)) / 1000.0
+        ``data.funding_rates`` is the single source of truth for funding
+        timing — display, seconds-to-funding, expected cost and the charge
+        itself all read this same schedule.
+        """
+        cached = self._funding_times.get(data.symbol)
+        if cached is None:
+            cached = sorted(data.funding_rates)
+            self._funding_times[data.symbol] = cached
+        return cached
+
+    def _funding_rate(self, data: BacktestData, timestamp: int) -> float:
+        """The most recently settled funding rate as of `timestamp`.
+
+        Live, this is ``premiumIndex.lastFundingRate``: the rate that actually
+        settled, used as the estimate of the next one.
+
+        Until V3.2 this snapped the timestamp onto an assumed 8-hour grid and
+        looked the bucket up directly. Real funding timestamps do not land on
+        that grid — the bulk archive's are calculation times, and Binance has
+        moved symbols to 4-hour funding — so the lookup missed and returned
+        0.0. A symbol with a full funding history was priced as if funding
+        did not exist.
+        """
+        times = self._funding_schedule(data)
+        if not times:
+            return 0.0
+        index = bisect_right(times, timestamp)
+        if index == 0:
+            return 0.0
+        return data.funding_rates[times[index - 1]]
+
+    def _seconds_to_funding(self, data: BacktestData, timestamp: int) -> float:
+        """Seconds until this symbol's next ACTUAL funding event.
+
+        ``inf`` when the schedule has no event after `timestamp` — either
+        because no funding history was loaded, or because the data ends first.
+        Infinity is the honest answer: the edge model reads it as ''no funding
+        falls inside the expected hold'', which is what not knowing should
+        mean. It is never replaced with a guessed 00:00/08:00/16:00 boundary.
+        The trust gate separately downgrades a run whose funding history is
+        missing, so this silence is always reported.
+        """
+        times = self._funding_schedule(data)
+        if not times:
+            return float("inf")
+        index = bisect_right(times, timestamp)
+        if index >= len(times):
+            return float("inf")
+        return (times[index] - timestamp) / 1000.0
 
     def _prices(self) -> dict[str, float]:
         return {

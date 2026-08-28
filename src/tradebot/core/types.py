@@ -744,7 +744,15 @@ class Position:
     take_profit: float
     strategy: str
     regime: MarketRegime
+    #: When the position was FILLED — not when the signal fired. Duration, the
+    #: maximum-hold cap and funding eligibility all measure from this. The two
+    #: fields below record the rest of the timeline; in live trading they are
+    #: set by the execution engine, in the backtest by the fill simulator.
     opened_at: int
+    #: When the decision was made. Every bar behind it had already closed.
+    signal_at: int = 0
+    #: When the order was submitted. Between signal_at and opened_at.
+    order_at: int = 0
     entry_notional: float = 0.0
     entry_fee: float = 0.0
     funding_paid: float = 0.0
@@ -815,6 +823,9 @@ class Trade:
     leverage: int
     stop_loss: float
     take_profit: float
+    #: The FILL timestamp, matching Position.opened_at. `duration_sec` is
+    #: measured from here, so it is time exposed to the market — not time
+    #: since a signal that had not yet been acted on.
     opened_at: int
     closed_at: int
     #: PnL as actually filled: (exit_fill - entry_fill) x qty x sign. Execution
@@ -828,6 +839,14 @@ class Trade:
 
     exit_reason: ExitReason
     regime: MarketRegime
+
+    # -- the timing ledger (V3.2) --------------------------------------- #
+    #: When the decision was made. `opened_at - signal_at` is the delay between
+    #: deciding and being in the market — zero would mean the fill was
+    #: instantaneous, which no real venue offers.
+    signal_at: int = 0
+    #: When the order was submitted.
+    order_at: int = 0
 
     # -- the cost ledger (V3.1) ----------------------------------------- #
     # One coherent accounting, so a report cannot double-count. The identity
@@ -877,7 +896,19 @@ class Trade:
 
     @property
     def duration_sec(self) -> float:
+        """Time held, measured from the FILL. See :attr:`opened_at`."""
         return max(0.0, (self.closed_at - self.opened_at) / 1000.0)
+
+    @property
+    def signal_to_fill_sec(self) -> float:
+        """How long the trade waited between decision and fill.
+
+        Zero when the timing was never recorded (a trade built before V3.2, or
+        by a caller that does not set `signal_at`) — not zero latency.
+        """
+        if not self.signal_at:
+            return 0.0
+        return max(0.0, (self.opened_at - self.signal_at) / 1000.0)
 
     @property
     def is_win(self) -> bool:

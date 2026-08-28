@@ -47,6 +47,8 @@ from typing import Any
 import numpy as np
 
 from tradebot.backtesting.engine import BacktestData, BacktestEngine, BacktestResult
+from tradebot.backtesting.execution import Scenario, scenarios
+from tradebot.backtesting.trust import TrustLevel, TrustReport
 from tradebot.core.config import TunableConfig, WalkForwardConfig
 from tradebot.core.logging import get_logger
 from tradebot.core.mathutil import safe_div
@@ -132,11 +134,31 @@ class WalkForwardReport:
     verdict: str
     warnings: list[str] = field(default_factory=list)
 
+    # -- provenance (V3.2) ---------------------------------------------- #
+    # What this run actually used. Before V3.2 none of it was recorded and
+    # none of it was chosen: the analyser called `BacktestEngine(config).run()`
+    # with no capital, no scenario and no seed, so it silently used the BASE
+    # scenario with seed 0 while the headline backtest used the configured
+    # seed. Two runs of "the same" system, quietly differing.
+    scenario: str = Scenario.BASE.value
+    seed: int = 0
+    initial_capital: float = 0.0
+    #: The same TrustReport the `backtest` command produces, from the same
+    #: `evaluate_trust`. A walk-forward on damaged data is not a second
+    #: opinion — it is the same wrong number, five times.
+    trust: TrustReport | None = None
+
+    @property
+    def trust_level(self) -> str:
+        return self.trust.level.value if self.trust else "NOT EVALUATED"
+
     def summary(self) -> str:
         lines = [
             "=" * 60,
             "WALK-FORWARD ANALYSIS",
             "=" * 60,
+            f"Data trust             {self.trust_level}",
+            f"Scenario / seed        {self.scenario} / {self.seed}",
             f"Folds                  {len(self.folds)}",
             f"Positive / negative    {self.positive_folds} / {self.negative_folds}",
             f"Consistency            {self.consistency:.0%} of folds positive",
@@ -172,9 +194,48 @@ class WalkForwardReport:
 class WalkForwardAnalyzer:
     """Runs walk-forward folds over historical data."""
 
-    def __init__(self, config: TunableConfig, walk_config: WalkForwardConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: TunableConfig,
+        walk_config: WalkForwardConfig | None = None,
+        *,
+        initial_capital: float | None = None,
+        scenario: Scenario = Scenario.BASE,
+        seed: int = 0,
+        trust: TrustReport | None = None,
+    ) -> None:
+        """Every execution input is named here, and none of it is incidental.
+
+        What is **identical** to the `backtest` command by construction: fees,
+        spread, slippage, latency, rejection and partial-fill behaviour (one
+        `scenarios()` table built from the same `config.backtest`), funding,
+        risk sizing, maximum concurrent positions, leverage, the maximum-hold
+        cap, and the strategy set — all of it reached through the same
+        `TunableConfig` and the same `BacktestEngine`.
+
+        What **intentionally differs**: this runs **one** scenario per fold,
+        not all three. Three scenarios across N folds would cost 3N engine
+        runs to answer a question about consistency across time, which is what
+        walk-forward is for; scenario sensitivity is what `backtest` measures.
+        The scenario is named in the report so the comparison is never
+        implicit.
+
+        `seed` defaults to 0 for backward compatibility with direct callers,
+        but the CLI passes the same seed as the headline run.
+        """
         self.config = config
         self.walk = walk_config or config.walk_forward
+        self.initial_capital = initial_capital or config.account.initial_capital
+        self.scenario = scenario
+        self.seed = seed
+        self.trust = trust
+        # One assumptions table, built exactly as run_scenarios() builds it.
+        self.assumptions = scenarios(
+            config.backtest.spread_bps,
+            config.backtest.slippage_bps,
+            config.backtest.taker_fee,
+            config.backtest.maker_fee,
+        )[scenario]
 
     # ------------------------------------------------------------------ #
     def build_folds(self, start_ms: int, end_ms: int) -> list[Fold]:
@@ -225,10 +286,12 @@ class WalkForwardAnalyzer:
         if not folds:
             span_days = (end - start) / DAY_MS
             needed = self.walk.train_days + self.walk.validation_days + self.walk.test_days
-            return _empty_report(
-                f"only {span_days:.1f} days of data; a single fold needs "
-                f"{needed} days. Download more history before drawing any "
-                f"conclusion."
+            return self._provenance(
+                _empty_report(
+                    f"only {span_days:.1f} days of data; a single fold needs "
+                    f"{needed} days. Download more history before drawing any "
+                    f"conclusion."
+                )
             )
 
         log.info(
@@ -240,12 +303,16 @@ class WalkForwardAnalyzer:
 
         results: list[FoldResult] = []
         for fold in folds:
-            train = BacktestEngine(self.config).run(data, fold.train_start, fold.train_end)
+            train = self._engine().run(
+                data, fold.train_start, fold.train_end, self.assumptions, seed=self.seed
+            )
             # The parameters are NOT refitted here. Automated search over the
             # training window is exactly how overfitting is manufactured; the
             # training run exists to measure in-sample performance so that
             # efficiency (out-of-sample / in-sample) is meaningful.
-            test = BacktestEngine(self.config).run(data, fold.test_start, fold.test_end)
+            test = self._engine().run(
+                data, fold.test_start, fold.test_end, self.assumptions, seed=self.seed
+            )
             results.append(FoldResult(fold=fold, train=train, test=test))
             log.info(
                 "walkforward_fold_complete",
@@ -255,7 +322,23 @@ class WalkForwardAnalyzer:
                 test_trades=test.metrics.total_trades,
             )
 
-        return self._summarise(results)
+        return self._provenance(self._summarise(results))
+
+    def _engine(self) -> BacktestEngine:
+        """A fresh engine with the SAME capital the headline backtest uses."""
+        return BacktestEngine(self.config, self.initial_capital)
+
+    def _provenance(self, report: WalkForwardReport) -> WalkForwardReport:
+        report.scenario = self.scenario.value
+        report.seed = self.seed
+        report.initial_capital = self.initial_capital
+        report.trust = self.trust
+        if self.trust is not None and self.trust.level is not TrustLevel.TRUSTED:
+            report.warnings.insert(
+                0,
+                f"data trust is {self.trust.level.value}: these folds are not evidence",
+            )
+        return report
 
     # ------------------------------------------------------------------ #
     def _summarise(self, results: list[FoldResult]) -> WalkForwardReport:

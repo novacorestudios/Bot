@@ -25,13 +25,26 @@ from tradebot.backtesting.engine import BacktestData
 from tradebot.core.errors import DataError
 from tradebot.core.logging import get_logger
 from tradebot.core.types import Candle, SymbolInfo, Timeframe
+from tradebot.data.validation import QualityStatus
 
 log = get_logger(__name__)
 
 
 @dataclass(slots=True)
 class DataQuality:
-    """What was found while loading. Surfaced with every backtest."""
+    """What was found while loading. Surfaced with every backtest.
+
+    This is one of the two implementations of the
+    :class:`~tradebot.backtesting.trust.DatasetQuality` contract — the other is
+    :class:`~tradebot.data.validation.ValidationReport`, produced at
+    acquisition time. Both report the **same** ``QualityStatus`` vocabulary, so
+    the trust gate does not care which one it is handed.
+
+    Before V3.2 this class had no ``status``, ``interval`` or ``missing_bars``,
+    while the trust gate read exactly those three through ``getattr(..., None)``.
+    The result was silent: every check that mattered evaluated to ``False`` and
+    structurally corrupt data was reported ``TRUSTED``.
+    """
 
     symbol: str
     timeframe: str
@@ -41,10 +54,67 @@ class DataQuality:
     largest_gap_bars: int = 0
     coverage: float = 1.0
     problems: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    missing_bars: int = 0
+    start_ms: int = 0
+    end_ms: int = 0
+    out_of_order: int = 0
+    non_positive_prices: int = 0
+    inconsistent_ohlc: int = 0
+
+    @property
+    def interval(self) -> str:
+        """The contract's name for :attr:`timeframe`. Same string."""
+        return self.timeframe
+
+    @property
+    def status(self) -> QualityStatus:
+        """UNUSABLE beats DEGRADED beats OK.
+
+        ``bars <= 0`` is UNUSABLE on its own: an empty series cannot be
+        backtested, whether or not anything else was noticed about it.
+        """
+        if self.problems or self.bars <= 0:
+            return QualityStatus.UNUSABLE
+        if self.warnings or self.missing_bars or self.gaps or self.duplicates_removed:
+            return QualityStatus.DEGRADED
+        return QualityStatus.OK
 
     @property
     def usable(self) -> bool:
-        return self.bars > 0 and not self.problems
+        return self.status is not QualityStatus.UNUSABLE
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "symbol": self.symbol,
+            "interval": self.interval,
+            "bars": self.bars,
+            "start_ms": self.start_ms,
+            "end_ms": self.end_ms,
+            "duplicates_removed": self.duplicates_removed,
+            "missing_bars": self.missing_bars,
+            "gaps": self.gaps,
+            "largest_gap_bars": self.largest_gap_bars,
+            "coverage": round(self.coverage, 6),
+            "status": self.status.value,
+            "problems": list(self.problems),
+            "warnings": list(self.warnings),
+        }
+
+    def row(self) -> dict[str, object]:
+        """One line of the machine-readable quality artifact."""
+        return {
+            "SYMBOL": self.symbol,
+            "INTERVAL": self.interval,
+            "START": self.start_ms,
+            "END": self.end_ms,
+            "ROWS": self.bars,
+            "MISSING": self.missing_bars,
+            "DUPLICATES": self.duplicates_removed,
+            "GAPS": self.gaps,
+            "COVERAGE": round(self.coverage, 4),
+            "QUALITY_STATUS": self.status.value,
+        }
 
 
 def load_candles(
@@ -66,6 +136,9 @@ def load_candles(
         raise DataError(f"data file is missing columns: {sorted(missing)}", path=str(path))
 
     before = len(frame)
+    # Out-of-order rows are counted BEFORE sorting: sorting hides the fact that
+    # the file arrived shuffled, which usually means the writer was broken.
+    quality.out_of_order = int((frame["open_time"].diff().dropna() < 0).sum())
     frame = frame.drop_duplicates(subset="open_time").sort_values("open_time")
     quality.duplicates_removed = before - len(frame)
 
@@ -73,16 +146,45 @@ def load_candles(
         quality.problems.append("file contains no rows")
         return [], quality
 
-    # Bars must be positive and internally consistent.
-    invalid = frame[
+    quality.start_ms = int(frame["open_time"].iloc[0])
+    quality.end_ms = int(frame["close_time"].iloc[-1])
+
+    # Any price at or below zero is not a price. Checked on all four legs:
+    # a non-positive high or low is just as impossible as a non-positive close,
+    # and before V3.2 neither was looked at.
+    non_positive = frame[
+        (frame["open"] <= 0) | (frame["high"] <= 0) | (frame["low"] <= 0) | (frame["close"] <= 0)
+    ]
+    if not non_positive.empty:
+        quality.non_positive_prices = int(len(non_positive))
+        quality.problems.append(f"{len(non_positive)} bars have a price at or below zero")
+
+    # The high is the highest price of the bar and the low is the lowest, so
+    # both open and close must lie between them. Checking only against close
+    # let a bar whose OPEN sits outside its range pass.
+    inconsistent = frame[
         (frame["high"] < frame["low"])
-        | (frame["close"] <= 0)
-        | (frame["open"] <= 0)
+        | (frame["high"] < frame["open"])
         | (frame["high"] < frame["close"])
+        | (frame["low"] > frame["open"])
         | (frame["low"] > frame["close"])
     ]
-    if not invalid.empty:
-        quality.problems.append(f"{len(invalid)} bars have impossible OHLC relationships")
+    if not inconsistent.empty:
+        quality.inconsistent_ohlc = int(len(inconsistent))
+        quality.problems.append(f"{len(inconsistent)} bars have impossible OHLC relationships")
+
+    if "volume" in frame.columns:
+        negative_volume = int((frame["volume"] < 0).sum())
+        if negative_volume:
+            quality.problems.append(f"{negative_volume} bars have negative volume")
+
+    if quality.out_of_order:
+        quality.problems.append(f"{quality.out_of_order} rows arrived out of chronological order")
+
+    if quality.duplicates_removed:
+        # Not fatal — the duplicate rows were dropped — but the file was wrong,
+        # and a dataset that needed repairing is not a clean dataset.
+        quality.warnings.append(f"{quality.duplicates_removed} duplicate timestamp(s) were dropped")
 
     try:
         interval_ms = Timeframe(timeframe).milliseconds
@@ -103,6 +205,7 @@ def load_candles(
 
     expected = int((frame["open_time"].iloc[-1] - frame["open_time"].iloc[0]) // interval_ms) + 1
     quality.coverage = len(frame) / max(1, expected)
+    quality.missing_bars = max(0, expected - len(frame))
 
     candles = [
         Candle(

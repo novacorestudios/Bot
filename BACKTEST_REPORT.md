@@ -209,3 +209,35 @@ host that can reach Binance.
 **Do not paper trade on the strength of this document.** See
 [`PAPER_TRADING_READINESS.md`](PAPER_TRADING_READINESS.md), which fails on the
 criteria that matter for exactly this reason.
+
+---
+
+## V3.2 — what changed about the measurement
+
+No result in this document was produced by a strategy change. V3.2 is a
+correctness patch: it changes what the numbers *mean*, not what the system
+trades.
+
+Three of the fixes change the interpretation of any result produced before them:
+
+**The trust line was not load-bearing.** `evaluate_trust()` read three
+attributes off an object that did not have them, so structurally corrupt data
+was reported `TRUSTED`. Any `TRUSTED` banner printed before V3.2 means only
+that the timeframes were present and the metadata was found — it says nothing
+about whether the bars themselves were sane. Re-run anything you intend to
+quote.
+
+**Trade durations were overstated by one decision interval.** `opened_at` held
+the signal timestamp while the fill happened at the next bar's open. Every
+duration statistic, and the 3600-second maximum-hold cap, measured from before
+the position existed — so positions were force-closed one interval early.
+
+**Funding was priced at zero on symbols that had a full funding history.** The
+rate lookup snapped onto an assumed 8-hour grid and missed the real event
+timestamps. Held positions were under-costed in the *edge estimate* (the
+accounting charge itself was already correct as of V3.1).
+
+Every run now writes `<report>.data_quality.json` alongside it, so any number in
+this document can be traced to the state of the data behind it.
+
+**Status: ENGINEERING / CORRECTNESS VERIFIED. PROFITABILITY NOT MEASURED.**

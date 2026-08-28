@@ -609,3 +609,284 @@ and extended to assert `embargo_is_evaluated is False` — the property the
 rename exists to make visible. The `WalkForwardConfig.validation_days` **config
 key keeps its historical name** so existing config files still load; only the
 `Fold` field, which describes what the window *is*, was renamed.
+
+---
+
+# V3.2 TRUST & TIMING CHANGES
+
+A correctness-only patch, run before the first backtest on real Binance
+history. No strategy was added, no parameter was tuned, no threshold was moved.
+
+Two of these defects were **completely silent** — they produced plausible
+numbers rather than errors — which is the reason the regression tests for them
+assert on the shape of the code and not only on its output.
+
+## P0 — the data trust gate was reading attributes that did not exist
+
+**Problem.** `evaluate_trust()` decided whether a dataset was damaged by
+reading `q.status`, `q.interval` and `q.missing_bars`. The objects it was
+actually handed are `DataQuality` instances from `load_dataset()`, and that
+class had none of those three attributes. The reads went through
+`getattr(q, "status", None)`, so every guard that depended on them evaluated to
+`False`. Not an error — a `None`.
+
+The effect, reproduced before any code was changed:
+
+```
+DataQuality.usable         = False      <- the loader knew
+getattr(q, 'status', None) = None       <- the gate could not ask
+TRUST LEVEL ON CORRUPT DATA = TRUSTED
+blockers = []   downgrades = []
+```
+
+That series had impossible OHLC, a 500-bar hole, seven duplicate timestamps and
+40% coverage. The gate reported `TRUSTED`. Only the missing-timeframe and
+missing-metadata checks — which read `data`, not `quality` — were ever live.
+
+**Fix.** One contract, stated once, and typed so the compiler enforces it.
+`DatasetQuality` is a `Protocol` in `backtesting/trust.py` naming exactly what
+the gate needs. Two classes implement it — `DataQuality` at load time and
+`ValidationReport` at acquisition time — and both now report the **same**
+`QualityStatus` vocabulary (`OK` / `DEGRADED` / `UNUSABLE`) rather than each
+having a private notion of "fine". `evaluate_trust()` takes
+`Sequence[DatasetQuality]` and reads the attributes directly. The defensive
+`getattr` defaults are gone, so the next schema drift is a mypy error rather
+than a confident wrong number.
+
+Detection was widened to everything the brief lists. `load_candles()` now
+records, and `DataQuality.status` now grades:
+
+| condition | status |
+| --- | --- |
+| impossible OHLC (high < low, or open/close outside the range) | UNUSABLE |
+| any price at or below zero, on any of the four legs | UNUSABLE |
+| negative volume | UNUSABLE |
+| rows out of chronological order | UNUSABLE |
+| a gap larger than the configured tolerance | UNUSABLE |
+| no rows at all | UNUSABLE |
+| duplicate timestamps (dropped, but the file was wrong) | DEGRADED |
+| a gap within tolerance | DEGRADED |
+| everything present and consistent | OK |
+
+Two checks were genuinely absent before, not merely unreachable: the OHLC
+consistency test compared `high` and `low` only against `close`, so a bar whose
+**open** sat outside its own range passed; and non-positive prices were checked
+on `open` and `close` but not on `high` or `low`.
+
+The decision table the gate now applies, in full:
+
+| condition | without `--allow-degraded` | with it |
+| --- | --- | --- |
+| no symbols loaded | REFUSED | REFUSED |
+| an UNUSABLE series | REFUSED | REFUSED |
+| a required timeframe absent | REFUSED | REFUSED |
+| a DEGRADED series | REFUSED | UNTRUSTED |
+| no exchangeInfo | UNTRUSTED | UNTRUSTED |
+| funding enabled, no funding history | UNTRUSTED | UNTRUSTED |
+| clean | TRUSTED | TRUSTED |
+
+Two properties hold by construction and are tested directly:
+`--allow-degraded` **cannot** rescue structurally corrupt data — before V3.2 it
+could, turning a refusal into a running backtest over impossible bars — and **no
+input condition reaches TRUSTED except a clean one**. An override can only move
+REFUSED to UNTRUSTED.
+
+**Tests.** `TestP0TheQualityContractIsShared` (6) and
+`TestP0DamagedDataIsRefused` (12), including the four corruptions the brief
+names driven through the real `tradebot backtest` process, and a property test
+that sweeps every dirty-quality shape against both flag settings asserting none
+of them reaches TRUSTED.
+
+## P0 — walk-forward did not use the trust gate at all
+
+**Problem.** `run_walkforward` called `load_dataset(..., strict=False)` and went
+straight to the analyser. The dataset `tradebot backtest` refused would run to
+completion under `tradebot walkforward` and print a verdict.
+
+**Fix.** Both commands now go through one `_load_and_trust()` helper — the trust
+logic is not duplicated, it is called twice. The walk-forward report carries the
+`TrustReport`, prints `Data trust` in its summary, exposes `data_trust` in its
+JSON, and prepends a warning when the level is not TRUSTED. A report produced by
+a direct caller that skipped the gate reads `NOT EVALUATED`, never `TRUSTED`.
+
+**Tests.** `TestP0WalkForwardUsesTheSameGate` (4), including a structural check
+that `run_walkforward` contains no second copy of the rules.
+
+## P0 — `opened_at` was the signal time, not the fill time
+
+**Problem.** `_open_position` filled at the next decision bar's open — correct,
+and deliberately so — then stamped the position `opened_at=timestamp`, the
+timestamp of the bar that produced the *signal*. Every position appeared to have
+been opened one decision interval before it existed.
+
+That is not cosmetic. `opened_at` is the origin for trade duration, for the
+3600-second maximum-hold cap (positions were force-closed one interval early,
+every time), for funding eligibility, and for every timing statistic.
+
+**Fix.** Three timestamps, named and separated:
+
+* `signal_at` — the decision point; every bar behind it had already closed.
+* `order_at` — submission. In the backtest this equals `signal_at`; the
+  simulator's latency assumption is priced into the fill, not the clock.
+* `filled_at` — the open of the next decision bar.
+
+`Position.opened_at` and `Trade.opened_at` now **are** `filled_at`. `signal_at`
+and `order_at` are explicit fields on both, defaulted so nothing older breaks,
+and `Trade.signal_to_fill_sec` exposes the delay. `_next_open` became
+`_next_fill`, returning the bar's `open_time` alongside its price, so the fill
+timestamp is derived from the same bar as the fill price and is deterministic.
+
+**Tests.** `TestP0OpenedAtIsTheFillTime` (9), including the brief's own example
+(signal 12:00 → fill 12:01 → `opened_at == 12:01`), the maximum-hold boundary
+either side of the cap, and an AST check that the `Position(...)` call passes
+`filled_at` to `opened_at` and `timestamp` to `signal_at`.
+
+## P1 — funding timing was computed from an assumed schedule
+
+**Problem.** Execution accounting already charged real historical funding events
+(V3.1). Two other places did not:
+
+```python
+interval = self.config.edge.funding_interval_hours * 3_600_000
+bucket = (timestamp // interval) * interval
+return data.funding_rates.get(bucket, 0.0)     # _funding_rate
+return (interval_ms - (timestamp % interval_ms)) / 1000.0   # _seconds_to_funding
+```
+
+`_funding_rate` snapped the timestamp onto an assumed 8-hour grid and looked
+that exact bucket up. Real funding timestamps do not land on that grid — the
+bulk archive stores calculation times, and Binance runs 4-hour funding on many
+symbols — so the lookup missed and returned `0.0`. A symbol with a complete
+funding history was scored as if funding did not exist.
+`_seconds_to_funding` never consulted the data at all; it produced a number from
+the invented schedule and fed it to the edge model.
+
+**Fix.** `data.funding_rates` is the single source of truth. `_funding_rate`
+returns the most recently *settled* rate at or before the timestamp — which is
+what `premiumIndex.lastFundingRate` means live — found by bisection over the
+symbol's actual event times. `_seconds_to_funding` counts to the actual next
+event. Where no event follows, it returns **infinity**: the edge model reads
+that as "no funding falls inside the expected hold", which is what not knowing
+should mean. No boundary is ever invented, and the trust gate separately
+downgrades any run whose funding history is missing, so the silence is always
+reported.
+
+**Tests.** `TestP1FundingComesFromTheRealSchedule` (7), including an off-grid
+event at `START + 3600000 + 137` that the old bucket lookup could not find, and
+a structural check that `funding_interval_hours` no longer appears in either
+method.
+
+## P1 — walk-forward silently ran a different configuration
+
+**Problem.** `WalkForwardAnalyzer.run` called
+`BacktestEngine(self.config).run(data, start, end)` — no capital, no execution
+assumptions, no seed. It therefore used the engine's fallbacks: the BASE
+scenario and **seed 0**, while the headline backtest used the configured seed.
+Two runs of "the same" system, quietly differing in their slippage draws.
+
+**Fix.** Every execution input is now named in `WalkForwardAnalyzer.__init__`
+and recorded in the report (`scenario`, `seed`, `initial_capital`). The
+assumptions table is built exactly as `run_scenarios()` builds it, from the same
+`config.backtest`. The CLI passes the same seed as the headline run.
+
+What is **identical** by construction, because it is reached through one
+`TunableConfig` and one `BacktestEngine`: fees, spread, slippage, latency,
+rejection and partial-fill behaviour, funding, risk sizing, maximum concurrent
+positions, leverage, the maximum-hold cap, and the strategy set.
+
+What **intentionally differs**, stated in the docstring so the comparison is
+never implicit: walk-forward runs **one** scenario per fold rather than all
+three. Three scenarios across N folds costs 3N engine runs to answer a question
+about consistency across time, which is what walk-forward is for; scenario
+sensitivity is what `backtest` measures.
+
+**Tests.** `TestP1WalkForwardMatchesTheBacktest` (4).
+
+## P1 — the machine-readable data quality artifact
+
+Every run now writes `<report>.data_quality.json` beside its report, with one
+row per symbol/interval carrying `SYMBOL`, `INTERVAL`, `START`, `END`, `ROWS`,
+`MISSING`, `DUPLICATES`, `GAPS`, `COVERAGE` and `QUALITY_STATUS`, plus the full
+trust verdict and per-series detail. It is written **before** the refusal check,
+so a refused run still leaves the evidence explaining why.
+
+**Tests.** `TestP1TheQualityArtifact` (4), `TestTheRealCommandsRunEndToEnd` (3).
+
+## V3.2 verification — what actually ran
+
+Every gate below was executed against the tree at this commit. Results are
+reported as they came back, including the one that could not run here.
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| Full suite | `pytest -q` | PASS — 1262 tests, 0 failures |
+| V3.2 regressions | `pytest tests/integration/test_v32_correctness.py -q` | PASS — 49 tests |
+| V3.1 regressions | `pytest tests/integration/test_v31_correctness.py -q` | PASS — 62 tests |
+| Lint | `ruff check src tests scripts` | PASS |
+| Format | `ruff format --check src tests scripts` | PASS — 140 files |
+| Types | `mypy src/tradebot` (strict via `pyproject.toml`) | PASS — 93 files, 0 errors |
+| Static analysis | `bandit -r src -c pyproject.toml -q` | PASS — 0 findings |
+| Dependency audit | `pip-audit -r requirements.txt --strict` | PASS — no known vulnerabilities |
+| Secret scan | `python scripts/check_secrets.py` | PASS — 161 files clean |
+| `walkforward` end to end | `tradebot walkforward --data … --report …` | PASS — exit 0 |
+| Docker image build | `docker build -f docker/Dockerfile -t tradebot:ci .` | **FAILED HERE** — see below |
+| Docker smoke tests | all six checks from the CI `build` job | PASS on the stand-in image |
+
+### The `walkforward` run, verbatim
+
+The change is visible in the first four lines of output — none of which existed
+before V3.2, because the command had no trust gate and recorded neither its
+scenario nor its seed:
+
+```
+  Data trust          TRUSTED
+  quality artifact    /tmp/wf.data_quality.json
+Data trust             TRUSTED
+Scenario / seed        BASE / 42
+```
+
+The verdict was `INCONCLUSIVE — only 1.0 days of data; a single fold needs 44
+days`, which is the correct answer for the fixture dataset and not a result
+about the strategies.
+
+### The Docker build genuinely failed, and it is the environment
+
+`docker build -f docker/Dockerfile -t tradebot:ci .` was attempted and returned
+**exit 100**:
+
+```
+Err:1 http://deb.debian.org/debian trixie InRelease
+  403  Forbidden [IP: 151.101.194.132 80]
+E: Failed to fetch http://deb.debian.org/debian/dists/trixie/InRelease
+The command '/bin/sh -c apt-get update && apt-get install -y ...' returned a non-zero code: 100
+```
+
+Both `deb.debian.org` and `docker.io`'s blob CDN return `403 Forbidden` through
+this sandbox's egress proxy — confirmed directly with `curl`, outside Docker —
+so the multi-stage build cannot fetch its base layers or its build toolchain.
+Nothing in the project is implicated.
+
+**The shipped Dockerfile is therefore NOT verified in this environment.** What
+was verified is a stand-in image carrying the same `src/`, `config/`,
+`scripts/` and `docker/entrypoint.sh`, with the same `ENTRYPOINT`/`CMD`
+contract, built from a reachable base mirror without the apt layers. All six
+checks the CI `build` job runs after the build pass against it:
+
+1. `validate-config` in PAPER with no credentials — exit 0
+2. `doctor` with no credentials and no network call — exit 0
+3. default `CMD` is exactly `["run"]`
+4. `TRADING_MODE=LIVE` without the acknowledgement — exit **78**, `REFUSING TO START`
+5. `TRADING_MODE=LIVE` against testnet with the acknowledgement — exit **78**
+6. the image runs as `tradebot`, not root
+
+That proves the CLI contract the smoke tests exercise. GitHub Actions is the
+authority for whether the shipped Dockerfile builds.
+
+### Status
+
+**ENGINEERING / CORRECTNESS VERIFIED.**
+**PROFITABILITY NOT MEASURED.**
+
+No strategy was added, no parameter was tuned, no threshold was moved. The
+purpose of V3.2 was to make the instrument trustworthy before it is pointed at
+real Binance history for the first time.

@@ -9,11 +9,14 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from tradebot.core.config import AppConfig
 from tradebot.core.errors import DataError
 from tradebot.core.logging import get_logger
+
+if TYPE_CHECKING:
+    from tradebot.backtesting.trust import TrustReport
 
 log = get_logger(__name__)
 
@@ -50,6 +53,95 @@ def _parse_date(text: str) -> int | None:
     raise SystemExit(f"cannot parse date: {text!r}\n  accepted forms: {', '.join(_DATE_FORMATS)}")
 
 
+def _load_and_trust(
+    config: AppConfig,
+    args: argparse.Namespace,
+    symbols: list[str],
+    required: list[str],
+) -> tuple[dict[str, Any], list[Any], TrustReport] | int:
+    """Load a dataset and decide whether it may be believed. One implementation.
+
+    Both `backtest` and `walkforward` come through here, so there is exactly
+    one place that decides trust and exactly one set of rules. Before V3.2
+    `walkforward` loaded with ``strict=False`` and never evaluated trust at
+    all: the same corrupt dataset the `backtest` command refused would run to
+    completion under `walkforward` and print a verdict.
+
+    Returns the loaded data with its TrustReport, or a process exit code.
+    """
+    from tradebot.backtesting.data import load_dataset
+    from tradebot.backtesting.trust import evaluate_trust
+    from tradebot.data.store import DataStore
+
+    try:
+        data, quality = load_dataset(args.data, symbols or None, required, strict=False)
+    except DataError as exc:
+        print(f"DATA ERROR: {exc}")
+        print("\nDownload history first:")
+        print("  python scripts/fetch_data.py --top 30 --intervals 1m,3m,5m,15m,1h \\")
+        print("      --start 2024-01-01 --end 2025-01-01 --out data")
+        return 1
+
+    if not data:
+        print(f"no usable data found in {args.data}")
+        return 1
+
+    trust = evaluate_trust(
+        data=data,
+        quality=quality,
+        required_timeframes=required,
+        funding_enabled=config.tunables.backtest.apply_funding,
+        have_exchange_info=bool(DataStore(args.data).load_exchange_info()),
+        allow_degraded=bool(getattr(args, "allow_degraded", False)),
+    )
+
+    print("\n" + "=" * 68)
+    print("DATA TRUST")
+    print("=" * 68)
+    for line in trust.lines():
+        print(line)
+
+    _write_quality_artifact(args, quality, trust)
+
+    if not trust.may_run:
+        print(
+            "\nREFUSED. These inputs cannot produce a result worth reading.\n"
+            "Fix the data, or pass --allow-degraded to inspect a run whose "
+            "output will be marked UNTRUSTED."
+        )
+        return 1
+
+    return data, quality, trust
+
+
+def _write_quality_artifact(
+    args: argparse.Namespace, quality: list[Any], trust: TrustReport
+) -> None:
+    """Drop the machine-readable quality report beside the run's own report.
+
+    One row per symbol/interval, with the columns the data pipeline documents:
+    SYMBOL, INTERVAL, START, END, ROWS, MISSING, DUPLICATES, GAPS, COVERAGE and
+    QUALITY_STATUS. The backtest report references this file by name, so a
+    result can always be traced back to the state of the data behind it.
+    """
+    report_path = Path(getattr(args, "report", "") or "reports/backtest.json")
+    path = report_path.with_name(f"{report_path.stem}.data_quality.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "dataset": str(args.data),
+                "trust": trust.as_dict(),
+                "rows": [q.row() for q in quality],
+                "detail": [q.as_dict() for q in quality],
+            },
+            indent=2,
+            default=str,
+        )
+    )
+    print(f"  quality artifact    {path}")
+
+
 async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:
     """Run a historical backtest across all three execution scenarios.
 
@@ -59,7 +151,6 @@ async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:
     and no `symbol_infos`, which meant the documented command silently produced
     a single-scenario run on placeholder filters and possibly damaged data.
     """
-    from tradebot.backtesting.data import load_dataset
     from tradebot.backtesting.report import BacktestReport
     from tradebot.backtesting.runner import (
         EdgeMode,
@@ -68,7 +159,7 @@ async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:
         run_strict_oos,
         split_continuous,
     )
-    from tradebot.backtesting.trust import TrustLevel, evaluate_trust
+    from tradebot.backtesting.trust import TrustLevel
     from tradebot.data.store import DataStore
 
     # Validate every argument BEFORE any work. This used to parse --split after
@@ -89,44 +180,10 @@ async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     required = list(config.tunables.timeframes.all())
 
-    try:
-        data, quality = load_dataset(args.data, symbols or None, required, strict=False)
-    except DataError as exc:
-        print(f"DATA ERROR: {exc}")
-        print("\nDownload history first:")
-        print("  python scripts/fetch_data.py --top 30 --intervals 1m,3m,5m,15m,1h \\")
-        print("      --start 2024-01-01 --end 2025-01-01 --out data")
-        return 1
-
-    if not data:
-        print(f"no usable data found in {args.data}")
-        return 1
-
-    # -- the trust gate: decided BEFORE the run, and it travels with it ----- #
-    store = DataStore(args.data)
-    exchange_info = store.load_exchange_info()
-    trust = evaluate_trust(
-        data=data,
-        quality=quality,
-        required_timeframes=required,
-        funding_enabled=config.tunables.backtest.apply_funding,
-        have_exchange_info=bool(exchange_info),
-        allow_degraded=bool(getattr(args, "allow_degraded", False)),
-    )
-
-    print("\n" + "=" * 68)
-    print("DATA TRUST")
-    print("=" * 68)
-    for line in trust.lines():
-        print(line)
-
-    if not trust.may_run:
-        print(
-            "\nREFUSED. These inputs cannot produce a result worth reading.\n"
-            "Fix the data, or pass --allow-degraded to inspect a run whose "
-            "output will be marked UNTRUSTED."
-        )
-        return 1
+    loaded = _load_and_trust(config, args, symbols, required)
+    if isinstance(loaded, int):
+        return loaded
+    data, quality, trust = loaded
 
     # -- edge mode: never mixed, always declared --------------------------- #
     tunables = config.tunables
@@ -153,7 +210,7 @@ async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:
         print("run measures what WOULD happen if that held — not that it does.")
 
     # -- all three scenarios, never one ------------------------------------- #
-    manifests = store.manifests()
+    manifests = DataStore(args.data).manifests()
     scenarios = run_scenarios(
         tunables,
         data,
@@ -274,33 +331,49 @@ async def run_backtest(config: AppConfig, args: argparse.Namespace) -> int:
 
 
 async def run_walkforward(config: AppConfig, args: argparse.Namespace) -> int:
-    """Run a walk-forward analysis."""
-    from tradebot.backtesting.data import load_dataset
+    """Run a walk-forward analysis, through the same trust gate as `backtest`.
+
+    Damaged data is refused here exactly as it is there, and the trust verdict
+    is carried in the printed summary and in the JSON report. A walk-forward
+    over five folds of corrupt data is not five pieces of evidence.
+    """
+    from tradebot.backtesting.execution import Scenario
+    from tradebot.backtesting.trust import TrustLevel
     from tradebot.backtesting.walkforward import WalkForwardAnalyzer
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    try:
-        data, _quality = load_dataset(
-            args.data,
-            symbols or None,
-            list(config.tunables.timeframes.all()),
-            strict=False,
-        )
-    except DataError as exc:
-        print(f"DATA ERROR: {exc}")
-        return 1
+    required = list(config.tunables.timeframes.all())
 
-    if not data:
-        print(f"no usable data found in {args.data}")
-        return 1
+    loaded = _load_and_trust(config, args, symbols, required)
+    if isinstance(loaded, int):
+        return loaded
+    data, _quality, trust = loaded
 
-    report = WalkForwardAnalyzer(config.tunables).run(data)
+    seed = int(getattr(args, "seed", 0) or 0)
+    report = WalkForwardAnalyzer(
+        config.tunables,
+        # Same capital, same scenario table, same seed as the headline run.
+        initial_capital=config.tunables.account.initial_capital,
+        scenario=Scenario.BASE,
+        seed=seed,
+        trust=trust,
+    ).run(data)
     print(report.summary())
+
+    if trust.level is not TrustLevel.TRUSTED:
+        print("\n" + "!" * 68)
+        print(trust.banner())
+        print("!" * 68)
 
     _write_report(
         args.report,
         {
             "verdict": report.verdict,
+            "data_trust": report.trust_level,
+            "trust_detail": trust.as_dict(),
+            "scenario": report.scenario,
+            "seed": report.seed,
+            "initial_capital": report.initial_capital,
             "consistency": report.consistency,
             "mean_test_return": report.mean_test_return,
             "median_test_return": report.median_test_return,

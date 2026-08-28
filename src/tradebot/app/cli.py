@@ -97,6 +97,14 @@ def build_parser() -> argparse.ArgumentParser:
     wf.add_argument("--data", required=True)
     wf.add_argument("--symbols", default="")
     wf.add_argument("--report", default="reports/walkforward.json")
+    # The same two flags the `backtest` command takes, because walk-forward now
+    # goes through the same trust gate and the same execution inputs.
+    wf.add_argument(
+        "--allow-degraded",
+        action="store_true",
+        help="run on gapped data; the result is marked UNTRUSTED",
+    )
+    wf.add_argument("--seed", type=int, default=42, help="execution simulator seed")
 
     return parser
 
