@@ -261,3 +261,47 @@ class TestScenarioReporting:
         an edge thinner than the error bars on the cost model."""
         results = run_scenarios(CONFIG, {}, seed=1)
         assert results.survives_stress is False  # no trades, no survival
+
+
+class TestReportHonesty:
+    """§28/§65: a zero and an absence look identical in a table and mean
+    opposite things. The report generator must never conflate them."""
+
+    def test_no_data_reports_not_measured_rather_than_zeros(self) -> None:
+        from tradebot.backtesting.report import BacktestReport
+
+        report = BacktestReport(run_scenarios(CONFIG, {}, seed=1))
+        payload = report.as_dict()
+        assert payload["status"] == "NOT MEASURED"
+        assert "performance" not in payload, "absent data must not produce a metrics table"
+
+    def test_the_markdown_explains_why_there_are_no_figures(self) -> None:
+        from tradebot.backtesting.report import BacktestReport
+
+        markdown = BacktestReport(run_scenarios(CONFIG, {}, seed=1)).markdown()
+        assert "NOT MEASURED" in markdown
+        assert "0.0" not in markdown.split("## Result")[-1]
+
+    def test_p95_duration_is_reported(self) -> None:
+        """§23 asks for average, median, P95 and max; P95 was missing."""
+        from tradebot.backtesting.report import duration_stats
+
+        assert set(duration_stats([])) >= {"average", "median", "p95", "max"}
+
+    def test_percentile_is_a_real_percentile(self) -> None:
+        import numpy as np
+
+        from tradebot.backtesting.report import percentile
+
+        values = [float(i) for i in range(1, 101)]
+        # Must agree with numpy, so an operator checking the number elsewhere
+        # does not find a different answer.
+        assert percentile(values, 0.5) == float(np.percentile(values, 50))
+        assert percentile(values, 0.95) == float(np.percentile(values, 95))
+        assert percentile([42.0], 0.95) == 42.0
+        assert percentile([], 0.5) == 0.0
+
+    def test_edge_calibration_reports_not_measured_without_trades(self) -> None:
+        from tradebot.backtesting.report import edge_calibration
+
+        assert edge_calibration([])["status"] == "NOT MEASURED"

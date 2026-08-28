@@ -130,6 +130,10 @@ reach live trading.
 | [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) | phases, gates, honest status, known risks |
 | [`AUDIT_REPORT.md`](AUDIT_REPORT.md) | the V1 deep technical audit — 22 findings, reproduced by execution |
 | [`IMPLEMENTATION_PLAN_V2.md`](IMPLEMENTATION_PLAN_V2.md) | the hardening plan for those findings |
+| [`BACKTEST_AUDIT.md`](BACKTEST_AUDIT.md) | the backtest engine audited — 21 findings, 4 critical |
+| [`DATA_PIPELINE.md`](DATA_PIPELINE.md) | how real Binance history is fetched, validated and stored |
+| [`BACKTEST_REPORT.md`](BACKTEST_REPORT.md) | **NOT VERIFIED** — no backtest on real data has been run |
+| [`PAPER_TRADING_READINESS.md`](PAPER_TRADING_READINESS.md) | **NOT READY** — 0 of 7 criteria pass, and why |
 | [`FINAL_AUDIT.md`](FINAL_AUDIT.md) | **read this before running anything** — what is verified, what is not, and what must happen before real money |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | components, pipeline, concurrency, recovery |
 | [`docs/TRADING_ENGINE.md`](docs/TRADING_ENGINE.md) | the decision pipeline in detail |

@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from tradebot.backtesting.engine import BacktestEngine, BacktestResult
 from tradebot.backtesting.execution import Scenario
 from tradebot.backtesting.runner import ScenarioResults
@@ -29,12 +31,17 @@ NOT_MEASURED = "NOT MEASURED"
 
 
 def percentile(values: list[float], fraction: float) -> float:
-    """Nearest-rank percentile. Returns 0.0 for an empty sample."""
+    """Linear-interpolation percentile, the conventional definition.
+
+    Nearest-rank would be defensible but disagrees with every other tool an
+    operator might check the number against, and a P95 that does not match
+    what pandas or numpy says invites the wrong argument.
+
+    Returns 0.0 for an empty sample — callers guard on the trade count.
+    """
     if not values:
         return 0.0
-    ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, round(fraction * (len(ordered) - 1))))
-    return ordered[index]
+    return float(np.percentile(np.asarray(values, dtype=float), fraction * 100.0))
 
 
 def duration_stats(trades: list[Trade]) -> dict[str, float]:
@@ -168,16 +175,28 @@ class BacktestReport:
 
     def as_dict(self) -> dict[str, Any]:
         result, engine = self._primary()
-        if result is None:
+
+        # A run over no data is NOT MEASURED. A run over real data that took no
+        # trades is a genuine result — "nothing cleared the gates" — and the two
+        # must not be conflated, because reporting the first as a table of
+        # zeros is the exact failure this module exists to avoid.
+        if result is None or result.bars_processed == 0:
             return {
                 "context": self.scenarios.context.as_dict(),
                 "status": NOT_MEASURED,
-                "reason": "no scenario produced a result",
+                "reason": (
+                    "no scenario produced a result"
+                    if result is None
+                    else "no bars were processed; the dataset was empty"
+                ),
             }
 
         trades = result.trades
         payload: dict[str, Any] = {
             "context": self.scenarios.context.as_dict(),
+            # Distinguishes "measured, and the answer is none" from "not
+            # measured". Ratio metrics below are undefined without trades.
+            "status": "MEASURED" if trades else "NO TRADES TAKEN",
             "scenario_comparison": self.scenarios.comparison(),
             "survives_stress": self.scenarios.survives_stress,
             "performance": result.metrics.as_dict(),
@@ -227,9 +246,20 @@ class BacktestReport:
                 "",
                 f"**{NOT_MEASURED}** — {data.get('reason', 'no data')}.",
                 "",
-                "No performance figures are given because none were produced.",
+                "No performance figures are given because none were produced. "
+                "A table of zeros here would be indistinguishable from a "
+                "measured result of zero, and they mean opposite things.",
             ]
             return "\n".join(lines)
+
+        if data.get("status") == "NO TRADES TAKEN":
+            lines += [
+                "> **No trades were taken.** The data was processed and every "
+                "candidate was refused by a gate — see the rejection table "
+                "below. This is a measured result, not a missing one: on data "
+                "with no edge, declining to trade is the correct behaviour.",
+                "",
+            ]
 
         missing = data.get("missing_timeframes")
         if missing:
