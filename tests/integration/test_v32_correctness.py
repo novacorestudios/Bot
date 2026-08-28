@@ -714,3 +714,39 @@ class TestTheRunStampsItsOwnVersion:
         context = build_context(CONFIG, {}, seed=42, manifests=[], notes="")
         assert context.code_version == CODE_VERSION
         assert context.as_dict()["code_version"] == "v3.2"
+
+
+def _universe_action():
+    """The --universe action, which lives on the `backtest` subparser."""
+    from tradebot.app.cli import build_parser
+
+    subparsers = next(iter(build_parser()._subparsers._group_actions))  # type: ignore[union-attr]
+    backtest = subparsers.choices["backtest"]
+    return next(a for a in backtest._actions if "--universe" in a.option_strings)
+
+
+class TestUniverseProvenanceLabels:
+    """A report must be able to say what its symbol list actually was. The two
+    original choices could not describe a hand-picked smoke universe: calling it
+    PRESENT_DAY implies a liquidity ranking it never had, and POINT_IN_TIME
+    would be a straight falsehood."""
+
+    def test_all_three_provenance_labels_are_accepted(self) -> None:
+        assert set(_universe_action().choices) == {
+            "POINT_IN_TIME_UNIVERSE",
+            "PRESENT_DAY_UNIVERSE",
+            "MANUAL_SMOKE_UNIVERSE",
+        }
+
+    def test_the_default_is_still_the_pessimistic_one(self) -> None:
+        """Defaulting to POINT_IN_TIME would let an unlabelled run imply it was
+        free of survivorship bias."""
+        assert _universe_action().default == "PRESENT_DAY_UNIVERSE"
+
+    def test_the_label_reaches_the_run_context(self) -> None:
+        from tradebot.backtesting.runner import build_context
+
+        context = build_context(CONFIG, {}, seed=42, manifests=[], notes="")
+        context.universe_provenance = "MANUAL_SMOKE_UNIVERSE"
+        assert context.as_dict()["universe_provenance"] == "MANUAL_SMOKE_UNIVERSE"
+        assert any("MANUAL_SMOKE_UNIVERSE" in line for line in context.lines())

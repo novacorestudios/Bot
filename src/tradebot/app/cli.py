@@ -76,10 +76,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bt.add_argument(
         "--universe",
-        choices=["POINT_IN_TIME_UNIVERSE", "PRESENT_DAY_UNIVERSE"],
+        choices=[
+            "POINT_IN_TIME_UNIVERSE",
+            "PRESENT_DAY_UNIVERSE",
+            "MANUAL_SMOKE_UNIVERSE",
+        ],
         default="PRESENT_DAY_UNIVERSE",
-        help="How the symbol list was chosen. PRESENT_DAY means survivorship "
-        "bias is present; say so rather than letting a report imply otherwise.",
+        help="How the symbol list was chosen. POINT_IN_TIME came from a listing "
+        "snapshot taken at the start of the period — the only one free of "
+        "survivorship bias. PRESENT_DAY was ranked by today's liquidity, so "
+        "symbols delisted since are missing. MANUAL_SMOKE was hand-picked to "
+        "exercise the pipeline and is not a research universe at all: it is "
+        "neither point-in-time nor ranked, and no result from it generalises. "
+        "Say which one it was rather than letting a report imply otherwise.",
     )
     bt.add_argument(
         "--edge-mode",
