@@ -32,7 +32,12 @@ from tradebot.data.manifest import DatasetManifest, dataset_fingerprint, utc_now
 
 log = get_logger(__name__)
 
-CODE_VERSION = "v3.1"
+#: Stamped into every run context and every report. It must be bumped with any
+#: change that alters what a result MEANS, because two runs of the same config
+#: and the same data are only comparable if the code behind them agrees. V3.2
+#: changed the trust verdict, the fill timestamp and the funding schedule — a
+#: report from that code claiming "v3.1" misidentifies its own provenance.
+CODE_VERSION = "v3.2"
 
 
 class OOSMode(StrEnum):

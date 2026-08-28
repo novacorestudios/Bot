@@ -694,3 +694,23 @@ class TestTheRealCommandsRunEndToEnd:
         visible = [c for c in data["BTCUSDT"].candles["1m"] if c.close_time <= end]
         assert visible
         assert max(c.close_time for c in visible) <= end
+
+
+class TestTheRunStampsItsOwnVersion:
+    """Found during the V3.2 readiness audit: the V3.2 code was stamping every
+    report `code_version: v3.1`. Two runs are only comparable if the code behind
+    them agrees, and V3.2 changed the trust verdict, the fill timestamp and the
+    funding schedule — so a report misidentifying its own provenance is exactly
+    the kind of quiet wrongness this patch exists to remove."""
+
+    def test_the_stamp_matches_this_patch(self) -> None:
+        from tradebot.backtesting.runner import CODE_VERSION
+
+        assert CODE_VERSION == "v3.2"
+
+    def test_the_stamp_reaches_the_run_context(self) -> None:
+        from tradebot.backtesting.runner import CODE_VERSION, build_context
+
+        context = build_context(CONFIG, {}, seed=42, manifests=[], notes="")
+        assert context.code_version == CODE_VERSION
+        assert context.as_dict()["code_version"] == "v3.2"
