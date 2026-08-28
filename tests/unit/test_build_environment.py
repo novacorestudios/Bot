@@ -108,3 +108,116 @@ class TestMakefile:
         check_line = next(line for line in makefile.splitlines() if line.startswith("check:"))
         for gate in ("lint", "type", "test", "security"):
             assert gate in check_line
+
+
+class TestContainerCommandContract:
+    """The image's ENTRYPOINT/CMD contract, and CI's obedience to it.
+
+    `docker/entrypoint.sh` ends with `exec python -m tradebot.app.cli "$@"`, so
+    the container command is a bare **subcommand** — `run`, `validate-config`,
+    and so on. `CMD ["run"]` in the Dockerfile is the contract stated in one
+    place; anything that passes an interpreter instead lands in argparse's
+    `command` positional and is rejected:
+
+        tradebot: error: argument command: invalid choice: 'python'
+
+    That is precisely what the Docker CI job did, and it is the kind of mistake
+    that reads as correct — the string `python -m tradebot.app.cli
+    validate-config` is a valid command, just not at this layer.
+    """
+
+    @pytest.fixture(scope="class")
+    def dockerfile(self) -> str:
+        return (ROOT / "docker" / "Dockerfile").read_text()
+
+    @pytest.fixture(scope="class")
+    def entrypoint(self) -> str:
+        return (ROOT / "docker" / "entrypoint.sh").read_text()
+
+    def test_the_entrypoint_supplies_the_interpreter(self, entrypoint):
+        """The premise of the whole contract."""
+        assert 'exec python -m tradebot.app.cli "$@"' in entrypoint
+
+    def test_the_dockerfile_default_command_is_a_bare_subcommand(self, dockerfile):
+        assert 'CMD ["run"]' in dockerfile
+
+    def test_the_dockerfile_entrypoint_runs_the_script(self, dockerfile):
+        assert "/usr/local/bin/entrypoint.sh" in dockerfile
+        assert "ENTRYPOINT" in dockerfile
+
+    def _container_commands(self, ci_workflow: str) -> list[str]:
+        """Every `docker run ... tradebot:ci <command>` argument in CI.
+
+        `docker compose exec` is deliberately not matched: it bypasses the
+        ENTRYPOINT, so an explicit interpreter is correct there.
+        """
+        commands: list[str] = []
+        # Join continuation lines so a wrapped `docker run` is one string.
+        joined = ci_workflow.replace("\\\n", " ")
+        for line in joined.splitlines():
+            stripped = line.strip()
+            if "docker run" not in stripped or "tradebot:ci" not in stripped:
+                continue
+            tokens = stripped.split()
+            index = tokens.index("tradebot:ci")
+            if index + 1 < len(tokens):
+                commands.append(tokens[index + 1])
+        return commands
+
+    def test_ci_invokes_the_image_at_all(self, ci_workflow):
+        assert self._container_commands(ci_workflow), (
+            "no docker run smoke test found; the image would ship unexercised"
+        )
+
+    def test_every_ci_container_command_is_a_real_subcommand(self, ci_workflow):
+        """The regression this class exists for."""
+        valid = {"validate-config", "doctor", "run", "scan", "backtest", "walkforward"}
+        offending = [c for c in self._container_commands(ci_workflow) if c not in valid]
+        assert not offending, (
+            f"CI passes {offending} as the container command, but the ENTRYPOINT "
+            f"already supplies the interpreter. Pass a bare subcommand from "
+            f"{sorted(valid)}."
+        )
+
+    def test_the_valid_subcommands_match_the_parser(self):
+        """Keeps the list above honest if a subcommand is ever added."""
+        from tradebot.app.cli import build_parser
+
+        actions = [a for a in build_parser()._actions if getattr(a, "choices", None) is not None]
+        parser_commands = set(actions[0].choices)
+        assert parser_commands == {
+            "validate-config",
+            "doctor",
+            "run",
+            "scan",
+            "backtest",
+            "walkforward",
+        }
+
+    def test_the_smoke_test_needs_no_credentials(self, ci_workflow):
+        """A smoke test that needed a secret could not run on a fork's PR."""
+        joined = ci_workflow.replace("\\\n", " ")
+        for line in joined.splitlines():
+            if "docker run" in line and "tradebot:ci" in line:
+                assert "BINANCE_API_KEY" not in line
+                assert "BINANCE_API_SECRET" not in line
+                assert "secrets." not in line
+
+    def test_the_smoke_test_never_arms_live_trading(self, ci_workflow):
+        """CI may prove the image REFUSES live; it must never satisfy the gate.
+
+        The refusal cases below deliberately set LIVE, so this asserts the one
+        thing that would actually be dangerous: never both the acknowledgement
+        and a real-money endpoint in the same invocation.
+        """
+        joined = ci_workflow.replace("\\\n", " ")
+        for line in joined.splitlines():
+            if "docker run" not in line or "tradebot:ci" not in line:
+                continue
+            armed = "I_UNDERSTAND_LIVE_TRADING_RISK=YES" in line and "BINANCE_TESTNET=false" in line
+            assert not armed, f"CI arms live trading: {line.strip()}"
+
+    def test_ci_proves_the_image_refuses_live(self, ci_workflow):
+        """The image's own refusal is a safety property worth a smoke test."""
+        assert "TRADING_MODE=LIVE" in ci_workflow
+        assert "78" in ci_workflow, "the EX_CONFIG refusal exit code is not asserted"

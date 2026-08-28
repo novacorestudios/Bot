@@ -85,7 +85,36 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build image
         run: docker build -f docker/Dockerfile -t tradebot:ci .
-      - name: Image must refuse to trade live without confirmation
+      # The ENTRYPOINT already prepends `python -m tradebot.app.cli`, so the
+      # container command is a bare SUBCOMMAND. Passing an interpreter here
+      # lands in the `command` positional and argparse rejects it.
+      - name: Config validates in PAPER mode with no credentials
+        run: docker run --rm -e TRADING_MODE=PAPER tradebot:ci validate-config
+      - name: Doctor runs without credentials and without a network call
+        run: docker run --rm -e TRADING_MODE=PAPER tradebot:ci doctor
+      - name: The default command is the engine, not a shell
+        run: docker inspect --format '{{json .Config.Cmd}}' tradebot:ci | grep -qx '\["run"\]'
+      # A mis-set container variable must be caught before the process can
+      # open a socket to Binance. Exit 78 is EX_CONFIG, from the entrypoint.
+      - name: Image refuses LIVE without the risk acknowledgement
         run: |
-          docker run --rm -e TRADING_MODE=PAPER tradebot:ci \
-            python -m tradebot.app.cli validate-config
+          set +e
+          output=$(docker run --rm -e TRADING_MODE=LIVE -e BINANCE_TESTNET=false \
+            tradebot:ci validate-config 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          test "$status" -eq 78 || { echo "expected exit 78, got $status"; exit 1; }
+          echo "$output" | grep -q "REFUSING TO START"
+      - name: Image refuses LIVE against the testnet endpoint
+        run: |
+          set +e
+          docker run --rm -e TRADING_MODE=LIVE -e BINANCE_TESTNET=true \
+            -e I_UNDERSTAND_LIVE_TRADING_RISK=YES tradebot:ci validate-config
+          status=$?
+          set -e
+          test "$status" -eq 78 || { echo "expected exit 78, got $status"; exit 1; }
+      - name: Image runs as a non-root user
+        run: |
+          user=$(docker inspect --format '{{.Config.User}}' tradebot:ci)
+          test "$user" = "tradebot" || { echo "image runs as '$user'"; exit 1; }

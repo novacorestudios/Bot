@@ -90,6 +90,44 @@ curl -s localhost:8080/health | python -m json.tool
 `/health` reports whether the bot is **functional**, not merely alive — a bot
 that is up but disconnected from Binance returns 503, and Docker restarts it.
 
+### The container command is a bare subcommand
+
+The image's `ENTRYPOINT` is `docker/entrypoint.sh`, which ends with:
+
+```sh
+exec python -m tradebot.app.cli "$@"
+```
+
+**The interpreter is already supplied.** Whatever you pass to `docker run` after
+the image name becomes the CLI's *subcommand*, so it must be one of
+`validate-config`, `doctor`, `run`, `scan`, `backtest`, `walkforward`.
+`CMD ["run"]` is the default.
+
+```bash
+docker run --rm -e TRADING_MODE=PAPER tradebot:ci validate-config   # correct
+docker run --rm tradebot:ci                                        # correct: CMD is `run`
+
+docker run --rm tradebot:ci python -m tradebot.app.cli validate-config
+# tradebot: error: argument command: invalid choice: 'python'
+```
+
+The last form reads as correct — that string *is* a valid command — but not at
+this layer, and it exits 2. If you need a raw interpreter (a debug shell, an
+ad-hoc script), override the entrypoint explicitly:
+
+```bash
+docker run --rm --entrypoint python tradebot:ci -c "import tradebot; print(tradebot.__file__)"
+```
+
+`docker compose exec` is the exception: it bypasses the `ENTRYPOINT`, so an
+explicit `python -m tradebot.app.cli ...` is correct there and is what the
+examples further down use.
+
+Before running anything, the entrypoint validates the configuration and, when
+`TRADING_MODE=LIVE`, refuses to start unless every confirmation agrees —
+exiting **78** (`EX_CONFIG`) rather than opening a socket to Binance. That
+refusal is exercised by CI on every build.
+
 ## Dashboard access
 
 The dashboard binds to **loopback only** unless `DASHBOARD_TOKEN` is set. It

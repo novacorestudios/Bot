@@ -202,6 +202,64 @@ class TestNonNegotiableRules:
         """Live must never trade on an assumed win rate."""
         assert CONFIG.edge.bootstrap_enabled is False
 
+    def test_paper_mode_binds_the_simulator_not_the_exchange(self):
+        """Rule 1, at the gateway: PAPER cannot place a real order.
+
+        The container smoke test runs in PAPER with no credentials, so this is
+        the property that makes running the image in CI safe. `self.gateway` is
+        the only object the execution engine sends orders to; in PAPER it must
+        be the simulator.
+
+        REST is still *constructed* in PAPER — it is the read-only market feed
+        the simulator prices against — so the assertion is specifically about
+        what `self.gateway` is bound to, not about which clients exist.
+
+        Read from the AST rather than by matching source text, so reformatting
+        cannot turn this into a false alarm.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from tradebot.app.runner import TradingEngine
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(TradingEngine._build)))
+
+        def assigns_gateway(node) -> list[ast.expr]:
+            """Right-hand sides of every `self.gateway = ...` under `node`."""
+            found = []
+            for child in ast.walk(node):
+                if not isinstance(child, ast.Assign):
+                    continue
+                for target in child.targets:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and target.attr == "gateway"
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "self"
+                    ):
+                        found.append(child.value)
+            return found
+
+        branches = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If) and "TradingMode.PAPER" in ast.unparse(node.test)
+        ]
+        assert branches, "the gateway is no longer selected on the trading mode"
+        branch = branches[0]
+
+        # Scoped to each arm: walking the `If` itself would sweep up the else
+        # branch's assignment and report PAPER binding the REST client.
+        paper = [ast.unparse(v) for n in branch.body for v in assigns_gateway(n)]
+        other = [ast.unparse(v) for n in branch.orelse for v in assigns_gateway(n)]
+
+        assert any(v.startswith("PaperBroker(") for v in paper), (
+            f"PAPER mode does not bind the simulator; it binds {paper}"
+        )
+        assert "rest" not in paper, "PAPER mode binds the live REST client as its order gateway"
+        assert other == ["rest"], f"the non-PAPER branch binds {other}, expected the REST client"
+
     def test_a_stop_can_never_be_tighter_than_the_round_trip_cost(self):
         """Such a trade is mathematically unable to pay for itself."""
         assert CONFIG.stops.min_stop_pct >= 2 * CONFIG.edge.taker_fee

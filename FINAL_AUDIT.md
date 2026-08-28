@@ -39,7 +39,8 @@ still lose money, and until it has traded, that is exactly the position here.
 | Any backtest result, win rate or Sharpe ratio | **NOT MEASURED — none exists** |
 | Paper trading works end to end against the exchange | **NOT VERIFIED** |
 | The system is profitable | **NOT VERIFIED, AND NOT CLAIMED** |
-| The Docker image builds | **NOT VERIFIED** locally — no daemon; CI covers it |
+| The container ENTRYPOINT/CMD contract | **VERIFIED** — exercised in a real container, both the correct and the broken form |
+| The **shipped** `docker/Dockerfile` builds | **NOT VERIFIED** here — `deb.debian.org` is blocked; CI covers it |
 
 ---
 
@@ -290,7 +291,13 @@ important section in this document.
    fabricated.
 4. **Paper trading has not been run end to end.** The paper broker is unit
    tested; it has never been driven by a live feed.
-5. **The Docker image has not been built here** — no daemon in this environment.
+5. **The shipped image has not been built here.** The sandbox blocks
+   `deb.debian.org` and Docker Hub's blob CDN, so the real Dockerfile's `apt`
+   layers cannot run. The ENTRYPOINT/CMD contract *was* verified in a real
+   container built from a local stand-in that copies `entrypoint.sh`,
+   `ENTRYPOINT`, `CMD`, `WORKDIR`, `PYTHONPATH` and the non-root user verbatim
+   from the shipped Dockerfile — so what was proven is the argument contract and
+   the LIVE refusal, not the shipped image's base layers.
 6. **The strategies' parameters are starting points, not optimised values.**
    Every threshold in `config/config.yaml` is a guess informed by convention.
    None has been validated.
