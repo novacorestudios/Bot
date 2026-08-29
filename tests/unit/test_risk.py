@@ -15,6 +15,7 @@ non-negotiable rules from the brief:
 from __future__ import annotations
 
 import random
+from dataclasses import replace
 
 import pytest
 
@@ -269,12 +270,59 @@ class TestPositionSizing:
         assert result.quantity == pytest.approx(0.04)
         assert result.margin_required == pytest.approx(4.0)
 
-    def test_per_trade_margin_cap_has_an_explicit_reason(self):
+    def test_risk_sized_quantity_above_margin_cap_is_reduced(self):
         result = PositionSizer(RiskConfig()).size(
             200.0, 0.005, 100.0, 98.0, Direction.LONG, make_symbol_info("X", min_notional=1.0)
         )
+        assert result.ok, result.detail
+        assert result.raw_quantity == pytest.approx(0.5)
+        assert result.quantity == pytest.approx(0.25)
+        assert result.risk_amount == pytest.approx(0.5)
+        assert result.margin_required == pytest.approx(5.0)
+        assert result.leverage == 5
+
+    def test_margin_clamp_rounds_down_to_exchange_step(self):
+        result = PositionSizer(RiskConfig()).size(
+            200.0,
+            0.005,
+            137.0,
+            135.0,
+            Direction.LONG,
+            make_symbol_info("X", step=0.03, min_notional=1.0),
+        )
+        assert result.ok, result.detail
+        assert result.quantity == pytest.approx(0.18)
+        assert result.quantity <= result.raw_quantity
+        assert result.margin_required < 5.0
+
+    @pytest.mark.parametrize(
+        ("min_qty", "min_notional", "reason"),
+        [
+            (0.3, 1.0, RejectionReason.SIZE_BELOW_MINIMUM),
+            (0.001, 30.0, RejectionReason.NOTIONAL_BELOW_MINIMUM),
+        ],
+    )
+    def test_exchange_minimum_that_cannot_fit_margin_cap_is_explicit(
+        self, min_qty, min_notional, reason
+    ):
+        result = PositionSizer(RiskConfig()).size(
+            200.0,
+            0.005,
+            100.0,
+            98.0,
+            Direction.LONG,
+            make_symbol_info("X", min_qty=min_qty, min_notional=min_notional),
+        )
         assert not result.ok
-        assert result.reason is RejectionReason.PER_TRADE_MARGIN_LIMIT
+        assert result.reason is reason
+
+    def test_exchange_max_quantity_reduces_but_never_increases_size(self):
+        info = make_symbol_info("X", min_notional=1.0)
+        info = replace(info, max_qty=0.1)
+        result = PositionSizer(RiskConfig()).size(200.0, 0.005, 100.0, 98.0, Direction.LONG, info)
+        assert result.ok, result.detail
+        assert result.quantity == pytest.approx(0.1)
+        assert result.quantity <= result.raw_quantity
 
     def test_total_margin_cap_has_an_explicit_reason(self):
         result = PositionSizer(RiskConfig()).size(

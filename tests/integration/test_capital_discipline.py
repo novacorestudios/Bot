@@ -142,7 +142,7 @@ class TestPreservationChangesRiskDecisions:
         # that preservation is not the thing that refused it.
         assert decision.reason is not RejectionReason.LOW_OPPORTUNITY_SCORE
 
-    def test_cautious_mode_sizes_smaller_than_normal(self, clock: VirtualClock) -> None:
+    def test_cautious_mode_never_sizes_larger_than_normal(self, clock: VirtualClock) -> None:
         normal = build_risk(clock)
         approved = normal.evaluate(make_opportunity("BTCUSDT", score=95.0), context())
 
@@ -152,9 +152,19 @@ class TestPreservationChangesRiskDecisions:
 
         if approved.approved and reduced.approved:
             assert reduced.intent is not None and approved.intent is not None
-            assert reduced.intent.quantity < approved.intent.quantity
+            assert reduced.intent.quantity <= approved.intent.quantity
+            if reduced.intent.quantity == approved.intent.quantity:
+                # An independent absolute margin ceiling may be tighter than
+                # both risk-sized quantities. Equality is valid only when that
+                # ceiling, rather than preservation, determines both sizes.
+                assert reduced.intent.metadata["margin_required"] == pytest.approx(
+                    CONFIG.risk.max_margin_per_trade
+                )
+                assert approved.intent.metadata["margin_required"] == pytest.approx(
+                    CONFIG.risk.max_margin_per_trade
+                )
         else:
-            # Sizing floors can refuse the reduced trade outright on a 75 USDT
+            # Sizing floors can refuse the reduced trade outright on a small
             # account — which is itself the preservation behaviour working.
             assert not reduced.approved or approved.approved
 

@@ -16,6 +16,8 @@ import inspect
 import pytest
 
 from tradebot.ai.analyzer import Advisory, AdvisoryKind, MarketAnalyzer
+from tradebot.app.runner import TradingEngine
+from tradebot.backtesting.engine import BacktestEngine
 from tradebot.core.config import load_tunables
 from tradebot.core.types import (
     Direction,
@@ -58,6 +60,16 @@ class TestNonNegotiableRules:
         assert constructors == ["risk/engine.py"], (
             f"OrderIntent is constructed outside the risk engine: {constructors}"
         )
+
+    def test_live_paper_and_backtest_share_the_same_risk_sizer(self):
+        """All modes must enter through RiskEngine -> PositionSizer."""
+        runner_init = inspect.getsource(TradingEngine.__init__)
+        backtest_init = inspect.getsource(BacktestEngine.__init__)
+        risk_init = inspect.getsource(RiskEngine.__init__)
+
+        assert "RiskEngine(" in runner_init  # both LIVE and PAPER use TradingEngine
+        assert "RiskEngine(" in backtest_init
+        assert "PositionSizer(" in risk_init
 
     def test_strategies_cannot_reach_the_account_or_exchange(self):
         """Rule 4, again: MarketView carries nothing actionable."""

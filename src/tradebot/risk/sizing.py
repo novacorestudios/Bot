@@ -192,13 +192,39 @@ class PositionSizer:
             raw_quantity = notional_cap / entry_price
 
         quantity = round_quantity(raw_quantity, symbol_info.step_size)
+
+        # Exchange maximums can only reduce a risk-authorized size.  Apply the
+        # regular LOT_SIZE ceiling here; order-type-specific MARKET_LOT_SIZE
+        # validation remains in the execution adapter.
+        if symbol_info.max_qty > 0:
+            quantity = min(
+                quantity,
+                round_quantity(symbol_info.max_qty, symbol_info.step_size),
+            )
+
+        # A margin limit is a sizing ceiling, not a reason to discard an
+        # otherwise valid risk-sized trade.  Clamp down to the largest
+        # exchange step representable under the per-trade cap at the effective
+        # leverage ceiling.  This can never increase quantity or stop risk.
+        volatility_ceiling = self.volatility_adjusted_max_leverage(volatility)
+        absolute_leverage_ceiling = min(cfg.max_leverage, symbol_info.max_leverage)
+        effective_leverage_ceiling = min(volatility_ceiling, absolute_leverage_ceiling)
+        margin_capped_quantity = round_quantity(
+            cfg.max_margin_per_trade * effective_leverage_ceiling / entry_price,
+            symbol_info.step_size,
+        )
+        quantity = min(quantity, margin_capped_quantity)
+
         if quantity <= 0:
             return observed(
                 SizingResult.reject(
                     RejectionReason.SIZE_BELOW_MINIMUM,
-                    f"risk-correct quantity {raw_quantity:.10g} rounds to zero at "
-                    f"step size {symbol_info.step_size}",
+                    f"risk-correct quantity {raw_quantity:.10g} has no positive "
+                    f"exchange step that fits the per-trade margin cap "
+                    f"{cfg.max_margin_per_trade:.4f}",
                     raw_quantity=raw_quantity,
+                    margin_cap=cfg.max_margin_per_trade,
+                    leverage_ceiling=float(effective_leverage_ceiling),
                 )
             )
 
@@ -207,7 +233,8 @@ class PositionSizer:
                 SizingResult.reject(
                     RejectionReason.SIZE_BELOW_MINIMUM,
                     f"quantity {quantity} below the symbol minimum "
-                    f"{symbol_info.min_qty}; sizing up would exceed the risk budget",
+                    f"{symbol_info.min_qty}; sizing up would exceed the risk or "
+                    f"per-trade margin budget",
                     quantity=quantity,
                     min_qty=symbol_info.min_qty,
                 )
@@ -250,23 +277,8 @@ class PositionSizer:
             min(balance_margin_budget, cfg.max_margin_per_trade, total_margin_budget),
         )
         needed_leverage = self.required_leverage(notional, margin_budget)
-        volatility_ceiling = self.volatility_adjusted_max_leverage(volatility)
-        absolute_leverage_ceiling = min(cfg.max_leverage, symbol_info.max_leverage)
         required_margin_at_absolute_ceiling = notional / max(1, absolute_leverage_ceiling)
 
-        if required_margin_at_absolute_ceiling > cfg.max_margin_per_trade:
-            return observed(
-                SizingResult.reject(
-                    RejectionReason.PER_TRADE_MARGIN_LIMIT,
-                    f"risk-correct position needs at least "
-                    f"{required_margin_at_absolute_ceiling:.4f} margin at "
-                    f"{absolute_leverage_ceiling}x, above the per-trade cap "
-                    f"{cfg.max_margin_per_trade:.4f}",
-                    margin_required=required_margin_at_absolute_ceiling,
-                    margin_cap=cfg.max_margin_per_trade,
-                    leverage_ceiling=float(absolute_leverage_ceiling),
-                )
-            )
         if (
             total_margin_available is not None
             and required_margin_at_absolute_ceiling > total_margin_available
