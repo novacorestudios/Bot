@@ -28,7 +28,7 @@
 extends: config.yaml
 
 account:
-  initial_capital: 75.0
+  initial_capital: 200.0
   quote_asset: USDT
 
 edge:

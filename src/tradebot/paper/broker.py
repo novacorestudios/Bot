@@ -298,6 +298,7 @@ class PaperBroker:
             regime=intent.regime,
             opened_at=self.clock.now_ms(),
             entry_notional=notional,
+            allocated_initial_margin=margin,
             entry_fee=fee,
             entry_slippage=slippage * quantity,
             initial_stop=intent.stop_loss,
@@ -489,7 +490,13 @@ class PaperBroker:
         self.account.fees_paid += exit_fee
         self.account.realized_pnl += gross - exit_fee - position.entry_fee
         self.account.margin_used = max(
-            0.0, self.account.margin_used - position.metadata.get("margin", 0.0)
+            0.0,
+            self.account.margin_used
+            - (
+                position.allocated_initial_margin
+                if position.allocated_initial_margin > 0
+                else position.metadata.get("margin", 0.0)
+            ),
         )
         self.account.positions.pop(position.symbol, None)
 

@@ -336,6 +336,7 @@ class TestAccounting:
         await paper.place_order(intent())
         assert paper.account.margin_used > 0
         position = paper.account.positions["TESTUSDT"]
+        assert position.allocated_initial_margin == pytest.approx(paper.account.margin_used)
         await paper.close_position("TESTUSDT", position, "x1")
         assert paper.account.margin_used == pytest.approx(0.0, abs=1e-9)
 

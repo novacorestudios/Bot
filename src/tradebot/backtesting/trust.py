@@ -83,6 +83,7 @@ class TrustReport:
     blockers: list[str] = field(default_factory=list)
     downgrades: list[str] = field(default_factory=list)
     overrides: list[str] = field(default_factory=list)
+    placeholder_filter_symbols: list[str] = field(default_factory=list)
 
     @property
     def is_trusted(self) -> bool:
@@ -107,6 +108,10 @@ class TrustReport:
             "blockers": list(self.blockers),
             "downgrades": list(self.downgrades),
             "overrides": list(self.overrides),
+            "exchange_filter_fidelity": {
+                "trusted": not self.placeholder_filter_symbols,
+                "placeholder_symbols": list(self.placeholder_filter_symbols),
+            },
         }
 
     def lines(self) -> list[str]:
@@ -204,10 +209,24 @@ def evaluate_trust(
             report.block(f"{message}. Re-run with --allow-degraded to proceed as UNTRUSTED")
 
     # -- missing metadata: downgrade -------------------------------------- #
-    if not have_exchange_info:
+    placeholder_symbols = sorted(
+        symbol
+        for symbol, entry in data.items()
+        if getattr(entry, "exchange_filter_provenance", "GENUINE_EXCHANGE_INFO") == "PLACEHOLDER"
+    )
+    # Backwards compatibility for direct callers that only know whether an
+    # exchangeInfo snapshot exists. Loaded datasets carry per-symbol provenance
+    # and are therefore authoritative when the snapshot has partial coverage.
+    if not have_exchange_info and not placeholder_symbols:
+        placeholder_symbols = sorted(data)
+
+    if placeholder_symbols:
+        report.placeholder_filter_symbols = placeholder_symbols
         report.downgrade(
-            "no exchangeInfo — tick size, step size and MINIMUM NOTIONAL are "
-            "placeholders, so the run may take positions the exchange rejects"
+            f"{len(placeholder_symbols)} symbol(s) use placeholder exchange filters "
+            f"({', '.join(placeholder_symbols)}) — tick size, step size and "
+            "MINIMUM NOTIONAL are not genuine exchangeInfo metadata, so the run "
+            "may take positions the exchange rejects"
         )
 
     if funding_enabled:

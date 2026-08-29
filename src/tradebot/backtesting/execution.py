@@ -301,7 +301,13 @@ class ExecutionSimulator:
 
 @dataclass(slots=True)
 class CostBreakdown:
-    """Aggregated costs across a run — the §29 table."""
+    """Aggregated costs across a run — the §29 table.
+
+    ``gross_pnl`` is reference-price gross PnL, before execution friction.
+    Trade-level ``gross_pnl`` deliberately remains fill-price gross PnL; using
+    it here and then subtracting spread/slippage/latency again double-counts
+    those costs in the aggregate report.
+    """
 
     gross_pnl: float = 0.0
     fees: float = 0.0
@@ -344,10 +350,12 @@ class CostBreakdown:
 
     def add_trade(self, trade: Any) -> None:
         self.trades += 1
-        self.gross_pnl += trade.gross_pnl
+        self.gross_pnl += trade.reference_gross_pnl
         self.fees += trade.fees
+        self.spread_cost += trade.spread_cost
         self.funding += trade.funding
         self.slippage_cost += trade.slippage_cost
+        self.latency_cost += trade.latency_cost
 
     def as_dict(self) -> dict[str, Any]:
         return {

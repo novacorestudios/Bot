@@ -31,6 +31,7 @@ class PortfolioState:
     total_short_exposure: float
     total_exposure: float
     margin_used: float
+    allocated_margin: float
     unrealized_pnl: float
     realized_pnl_today: float
     position_count: int
@@ -75,6 +76,7 @@ class PortfolioState:
             "exposure_ratio": round(self.exposure_ratio, 3),
             "margin_used": round(self.margin_used, 4),
             "margin_usage": round(self.margin_usage, 3),
+            "allocated_margin": round(self.allocated_margin, 4),
             "unrealized_pnl": round(self.unrealized_pnl, 4),
             "realized_pnl_today": round(self.realized_pnl_today, 4),
             "position_count": self.position_count,
@@ -102,6 +104,7 @@ class PortfolioTracker:
         short_exposure = 0.0
         open_risk = 0.0
         margin_used = 0.0
+        allocated_margin = 0.0
         per_symbol: dict[str, float] = {}
         unprotected: list[str] = []
         computed_unrealized = 0.0
@@ -117,6 +120,11 @@ class PortfolioTracker:
 
             per_symbol[symbol] = per_symbol.get(symbol, 0.0) + notional
             margin_used += position.margin(price)
+            allocated_margin += (
+                position.allocated_initial_margin
+                if position.allocated_initial_margin > 0
+                else position.entry_notional / max(1, position.leverage)
+            )
             computed_unrealized += position.unrealized_pnl(price)
 
             # Open risk = what this position loses if its stop is hit from here.
@@ -144,6 +152,7 @@ class PortfolioTracker:
             total_short_exposure=short_exposure,
             total_exposure=long_exposure + short_exposure,
             margin_used=margin_used,
+            allocated_margin=allocated_margin,
             unrealized_pnl=unrealized_pnl or computed_unrealized,
             realized_pnl_today=realized_pnl_today,
             position_count=len(positions),
@@ -230,6 +239,15 @@ class PortfolioTracker:
                 f"margin usage would be "
                 f"{safe_div(projected_margin, equity, 0) * 100:.1f}%, above "
                 f"{cfg.max_margin_usage * 100:.0f}%",
+            )
+
+        projected_allocated = state.allocated_margin + margin
+        if projected_allocated > cfg.max_total_allocated_margin:
+            return (
+                True,
+                "TOTAL_MARGIN",
+                f"allocated initial margin would be {projected_allocated:.4f}, "
+                f"above the absolute {cfg.max_total_allocated_margin:.4f} limit",
             )
 
         if margin > state.available_balance:

@@ -62,7 +62,12 @@ LIQUID = LiquiditySnapshot("TESTUSDT", 1.0, 500_000.0, 500_000.0, 0.0, 1e9)
 # --------------------------------------------------------------------------- #
 class TestPositionSizing:
     def sizer(self, **overrides) -> PositionSizer:
-        return PositionSizer(RiskConfig(**overrides))
+        params = {
+            "max_margin_per_trade": 10_000.0,
+            "max_total_allocated_margin": 40_000.0,
+        }
+        params.update(overrides)
+        return PositionSizer(RiskConfig(**params))
 
     def test_risk_is_defined_by_stop_distance(self):
         """0.5% of 75 USDT is 0.375 USDT risked, whatever the stop distance."""
@@ -93,7 +98,14 @@ class TestPositionSizing:
         stops cannot use the full risk allowance. Raising max_symbol_exposure is
         the lever, and it should be changed knowingly, not by accident.
         """
-        sizer = PositionSizer(RiskConfig(risk_per_trade=0.005, max_symbol_exposure=1.0))
+        sizer = PositionSizer(
+            RiskConfig(
+                risk_per_trade=0.005,
+                max_symbol_exposure=1.0,
+                max_margin_per_trade=10_000.0,
+                max_total_allocated_margin=40_000.0,
+            )
+        )
         info = make_symbol_info("X", min_notional=1.0)
         result = sizer.size(75.0, 0.005, 100.0, 99.8, Direction.LONG, info)
         assert result.ok
@@ -109,8 +121,20 @@ class TestPositionSizing:
 
     def test_leverage_does_not_change_the_risk(self):
         """Leverage changes margin, not risk. This is the central point."""
-        low = PositionSizer(RiskConfig(max_leverage=2))
-        high = PositionSizer(RiskConfig(max_leverage=20))
+        low = PositionSizer(
+            RiskConfig(
+                max_leverage=2,
+                max_margin_per_trade=10_000.0,
+                max_total_allocated_margin=40_000.0,
+            )
+        )
+        high = PositionSizer(
+            RiskConfig(
+                max_leverage=20,
+                max_margin_per_trade=10_000.0,
+                max_total_allocated_margin=40_000.0,
+            )
+        )
         info = make_symbol_info("X", min_notional=1.0)
         a = low.size(1000.0, 0.005, 100.0, 99.0, Direction.LONG, info)
         b = high.size(1000.0, 0.005, 100.0, 99.0, Direction.LONG, info)
@@ -174,7 +198,14 @@ class TestPositionSizing:
 
     def test_liquidation_too_close_to_the_stop_is_rejected(self):
         """The exchange must never be able to close a position before our stop."""
-        sizer = PositionSizer(RiskConfig(max_leverage=100, min_liquidation_distance_multiple=3.0))
+        sizer = PositionSizer(
+            RiskConfig(
+                max_leverage=100,
+                min_liquidation_distance_multiple=3.0,
+                max_margin_per_trade=10_000.0,
+                max_total_allocated_margin=40_000.0,
+            )
+        )
         info = make_symbol_info("X", min_notional=1.0, max_leverage=100)
         # A 5% stop at 50x: liquidation sits ~2% away, well inside the stop.
         result = sizer.size(100.0, 0.02, 100.0, 95.0, Direction.LONG, info, available_margin=2.0)
@@ -210,6 +241,84 @@ class TestPositionSizing:
         assert (
             not self.sizer().size(0.0, 0.005, 100.0, 99.0, Direction.LONG, make_symbol_info("X")).ok
         )
+
+    def test_target_account_position_never_exceeds_five_usdt_margin(self):
+        sizer = PositionSizer(RiskConfig())
+        result = sizer.size(
+            200.0, 0.005, 100.0, 96.0, Direction.LONG, make_symbol_info("X", min_notional=1.0)
+        )
+        assert result.ok, result.detail
+        assert result.margin_required <= 5.0
+        assert result.leverage <= 5
+
+    def test_leverage_is_minimum_needed_not_forced_to_five(self):
+        sizer = PositionSizer(RiskConfig())
+        result = sizer.size(
+            200.0, 0.005, 100.0, 75.0, Direction.LONG, make_symbol_info("X", min_notional=1.0)
+        )
+        assert result.ok, result.detail
+        assert result.leverage == 1
+
+    def test_risk_quantity_is_not_increased_to_consume_margin(self):
+        sizer = PositionSizer(RiskConfig())
+        result = sizer.size(
+            200.0, 0.005, 100.0, 75.0, Direction.LONG, make_symbol_info("X", min_notional=1.0)
+        )
+        assert result.ok, result.detail
+        assert result.raw_quantity == pytest.approx(0.04)
+        assert result.quantity == pytest.approx(0.04)
+        assert result.margin_required == pytest.approx(4.0)
+
+    def test_per_trade_margin_cap_has_an_explicit_reason(self):
+        result = PositionSizer(RiskConfig()).size(
+            200.0, 0.005, 100.0, 98.0, Direction.LONG, make_symbol_info("X", min_notional=1.0)
+        )
+        assert not result.ok
+        assert result.reason is RejectionReason.PER_TRADE_MARGIN_LIMIT
+
+    def test_total_margin_cap_has_an_explicit_reason(self):
+        result = PositionSizer(RiskConfig()).size(
+            200.0,
+            0.005,
+            100.0,
+            90.0,
+            Direction.LONG,
+            make_symbol_info("X", min_notional=1.0),
+            total_margin_available=1.9,
+        )
+        assert not result.ok
+        assert result.reason is RejectionReason.TOTAL_MARGIN_LIMIT
+
+    def test_leverage_limit_has_an_explicit_reason(self):
+        config = RiskConfig(
+            max_leverage=2,
+            max_margin_per_trade=100.0,
+            max_total_allocated_margin=100.0,
+        )
+        result = PositionSizer(config).size(
+            200.0,
+            0.005,
+            100.0,
+            95.0,
+            Direction.LONG,
+            make_symbol_info("X", min_notional=1.0, max_leverage=2),
+            available_margin=5.0,
+        )
+        assert not result.ok
+        assert result.reason is RejectionReason.LEVERAGE_LIMIT
+
+    def test_exchange_minimum_never_causes_risk_oversizing(self):
+        result = PositionSizer(RiskConfig()).size(
+            200.0,
+            0.005,
+            100.0,
+            90.0,
+            Direction.LONG,
+            make_symbol_info("X", min_notional=20.0),
+        )
+        assert not result.ok
+        assert result.reason is RejectionReason.NOTIONAL_BELOW_MINIMUM
+        assert result.checks["implied_risk"] > result.checks["budgeted_risk"]
 
 
 # --------------------------------------------------------------------------- #
@@ -399,6 +508,35 @@ class TestPortfolio:
         assert tracker.remaining_risk_budget(empty) == pytest.approx(20.0)
         assert tracker.remaining_risk_budget(loaded) < 20.0
 
+    def test_allocated_initial_margin_does_not_move_with_mark_price(self):
+        from dataclasses import replace
+
+        tracker = self.tracker()
+        position = replace(
+            position_for("A", quantity=0.2, leverage=5), allocated_initial_margin=4.0
+        )
+        low = tracker.state(200.0, 196.0, {"A": position}, {"A": 50.0})
+        high = tracker.state(200.0, 196.0, {"A": position}, {"A": 150.0})
+        assert low.margin_used != high.margin_used
+        assert low.allocated_margin == pytest.approx(4.0)
+        assert high.allocated_margin == pytest.approx(4.0)
+
+    def test_total_allocated_margin_never_exceeds_twenty(self):
+        from dataclasses import replace
+
+        tracker = self.tracker(max_concurrent_positions=10)
+        positions = {
+            symbol: replace(
+                position_for(symbol, quantity=0.2, leverage=5), allocated_initial_margin=5.0
+            )
+            for symbol in ("A", "B", "C", "D")
+        }
+        state = tracker.state(200.0, 180.0, positions, dict.fromkeys(positions, 100.0))
+        breached, limit, _ = tracker.would_breach(state, "E", Direction.SHORT, 1.0, 0.0, 0.01)
+        assert state.allocated_margin == pytest.approx(20.0)
+        assert breached
+        assert limit == "TOTAL_MARGIN"
+
 
 # --------------------------------------------------------------------------- #
 # Kill switches
@@ -449,6 +587,66 @@ class TestKillSwitches:
         manager.record_trade_result(won=False)
         manager.evaluate(1000.0)
         assert manager.entries_allowed
+
+    def test_consecutive_loss_cooldown_expiry_preserves_counter_and_retrips(self):
+        """Characterize the current re-arm semantics; this is not a desired-state test."""
+        clock = VirtualClock(1_700_000_000_000)
+        manager = KillSwitchManager(
+            KillSwitchConfig(auto_rearm_seconds=900),
+            RiskConfig(max_consecutive_losses=5),
+            clock,
+        )
+        manager.evaluate(1000.0)
+        for _ in range(5):
+            manager.record_trade_result(won=False)
+
+        manager.evaluate(1000.0)
+        assert manager.consecutive_losses == 5
+        assert SwitchName.CONSECUTIVE_LOSSES in manager.active
+        assert not manager.entries_allowed
+
+        clock.advance(899)
+        manager.evaluate(1000.0)
+        assert SwitchName.CONSECUTIVE_LOSSES in manager.active
+
+        clock.advance(1)
+        manager.evaluate(1000.0)
+        assert manager.entries_allowed  # expiry occurs at the end of this evaluation
+        assert manager.consecutive_losses == 5
+
+        manager.evaluate(1000.0)
+        assert SwitchName.CONSECUTIVE_LOSSES in manager.active
+        assert not manager.entries_allowed
+        assert manager.consecutive_losses == 5
+
+    def test_new_trading_day_resets_consecutive_losses(self):
+        clock = VirtualClock(1_700_000_000_000)
+        manager = KillSwitchManager(
+            KillSwitchConfig(auto_rearm_seconds=900),
+            RiskConfig(max_consecutive_losses=5, day_reset_hour_utc=0),
+            clock,
+        )
+        manager.evaluate(1000.0)
+        for _ in range(5):
+            manager.record_trade_result(won=False)
+        manager.evaluate(1000.0)
+        assert not manager.entries_allowed
+
+        clock.advance(86_400)
+        manager.evaluate(1000.0)
+        assert manager.consecutive_losses == 0
+        assert SwitchName.CONSECUTIVE_LOSSES not in manager.active
+
+    def test_kill_switch_only_blocks_entries_not_exits(self):
+        """The manager exposes no exit gate; a trip changes entries_allowed only."""
+        manager = self.manager(max_consecutive_losses=5)
+        manager.evaluate(1000.0)
+        for _ in range(5):
+            manager.record_trade_result(won=False)
+        manager.evaluate(1000.0)
+
+        assert not manager.entries_allowed
+        assert not hasattr(manager, "exits_allowed")
 
     def test_api_error_burst_halts_entries(self):
         manager = self.manager()
@@ -681,7 +879,7 @@ def make_opportunity(
     symbol: str = "TESTUSDT",
     direction: Direction = Direction.LONG,
     entry: float = 100.0,
-    stop_pct: float = 0.005,
+    stop_pct: float = 0.020,
     target_pct: float = 0.010,
     strategy: str = "momentum",
     edge: float = 0.0015,

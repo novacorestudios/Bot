@@ -317,6 +317,10 @@ class RiskEngine:
                 else context.available_balance,
                 context.equity * self.config.risk.max_margin_usage - state.margin_used,
             ),
+            total_margin_available=max(
+                0.0,
+                self.config.risk.max_total_allocated_margin - state.allocated_margin,
+            ),
             volatility=opportunity.market.volatility,
         )
         if self.recorder is not None:
@@ -370,6 +374,7 @@ class RiskEngine:
                 "DIRECTION_EXPOSURE": RejectionReason.DIRECTION_EXPOSURE_LIMIT,
                 "TOTAL_EXPOSURE": RejectionReason.EXPOSURE_LIMIT,
                 "MARGIN_USAGE": RejectionReason.MARGIN_LIMIT,
+                "TOTAL_MARGIN": RejectionReason.TOTAL_MARGIN_LIMIT,
                 "AVAILABLE_BALANCE": RejectionReason.INSUFFICIENT_BALANCE,
                 "EQUITY": RejectionReason.INSUFFICIENT_BALANCE,
             }.get(limit, RejectionReason.RISK_BUDGET_EXCEEDED)
@@ -426,7 +431,6 @@ class RiskEngine:
             risk_fraction=safe_div(sizing.risk_amount, context.equity, 0.0),
             leverage=sizing.leverage,
             notional=sizing.notional,
-            margin_required=sizing.margin_required,
             liquidation_distance_multiple=sizing.liquidation_distance_multiple,
             portfolio_open_risk=state.total_open_risk,
             portfolio_open_risk_pct=state.open_risk_fraction,

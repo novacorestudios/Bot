@@ -12,6 +12,8 @@ if broken, would make a backtest flatter itself:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from tradebot.backtesting.execution import (
@@ -174,6 +176,32 @@ class TestNoFill:
 
 
 class TestCostBreakdown:
+    @staticmethod
+    def trade(
+        *,
+        direction: Direction,
+        reference_gross: float,
+        spread: float = 0.0,
+        slippage: float = 0.0,
+        latency: float = 0.0,
+        fees: float = 0.0,
+        funding: float = 0.0,
+    ) -> SimpleNamespace:
+        execution_cost = spread + slippage + latency
+        return SimpleNamespace(
+            direction=direction,
+            reference_gross_pnl=reference_gross,
+            # Fill-price gross already contains execution friction. The
+            # aggregate must not use this value and subtract friction again.
+            gross_pnl=reference_gross - execution_cost,
+            spread_cost=spread,
+            slippage_cost=slippage,
+            latency_cost=latency,
+            fees=fees,
+            funding=funding,
+            net_pnl=reference_gross - execution_cost - fees - funding,
+        )
+
     def test_net_is_gross_minus_every_component(self) -> None:
         breakdown = CostBreakdown(
             gross_pnl=10.0,
@@ -218,3 +246,80 @@ class TestCostBreakdown:
             "Net PnL",
         ):
             assert component in lines
+
+    @pytest.mark.parametrize(
+        "trade",
+        [
+            trade.__func__(
+                direction=Direction.LONG,
+                reference_gross=3.0,
+                spread=0.20,
+                slippage=0.30,
+                latency=0.10,
+                fees=0.15,
+            ),
+            trade.__func__(
+                direction=Direction.SHORT,
+                reference_gross=2.5,
+                spread=0.15,
+                slippage=0.25,
+                latency=0.05,
+                fees=0.12,
+            ),
+            trade.__func__(direction=Direction.LONG, reference_gross=1.25),
+            trade.__func__(
+                direction=Direction.LONG,
+                reference_gross=2.0,
+                fees=0.1,
+                funding=0.2,
+            ),
+            trade.__func__(
+                direction=Direction.SHORT,
+                reference_gross=2.0,
+                fees=0.1,
+                funding=-0.2,
+            ),
+        ],
+        ids=["long", "short", "zero-cost", "funding-paid", "funding-received"],
+    )
+    def test_reference_gross_ledger_balances_for_each_trade(self, trade: SimpleNamespace) -> None:
+        breakdown = CostBreakdown()
+        breakdown.add_trade(trade)
+        assert breakdown.net_pnl == pytest.approx(trade.net_pnl)
+        assert breakdown.net_pnl == pytest.approx(
+            trade.reference_gross_pnl
+            - trade.spread_cost
+            - trade.slippage_cost
+            - trade.latency_cost
+            - trade.fees
+            - trade.funding
+        )
+
+    def test_multiple_trades_aggregate_without_double_counting(self) -> None:
+        trades = [
+            self.trade(
+                direction=Direction.LONG,
+                reference_gross=3.0,
+                spread=0.2,
+                slippage=0.3,
+                latency=0.1,
+                fees=0.15,
+                funding=0.05,
+            ),
+            self.trade(
+                direction=Direction.SHORT,
+                reference_gross=-1.0,
+                spread=0.1,
+                slippage=0.2,
+                latency=0.05,
+                fees=0.1,
+                funding=-0.02,
+            ),
+        ]
+        breakdown = CostBreakdown()
+        for trade in trades:
+            breakdown.add_trade(trade)
+
+        assert breakdown.trades == 2
+        assert breakdown.gross_pnl == pytest.approx(sum(t.reference_gross_pnl for t in trades))
+        assert breakdown.net_pnl == pytest.approx(sum(t.net_pnl for t in trades))

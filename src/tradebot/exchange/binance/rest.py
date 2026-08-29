@@ -579,6 +579,10 @@ class BinanceFuturesREST:
                 ).MarketRegime.SIDEWAYS,
                 opened_at=int(entry.get("updateTime", 0) or 0),
                 entry_notional=quantity * entry_price,
+                allocated_initial_margin=float(
+                    entry.get("positionInitialMargin", 0)
+                    or quantity * entry_price / max(1, int(float(entry.get("leverage", 1) or 1)))
+                ),
                 metadata={
                     "liquidation_price": float(entry.get("liquidationPrice", 0) or 0),
                     "mark_price": float(entry.get("markPrice", 0) or 0),

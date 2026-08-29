@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from tradebot.backtesting.engine import BacktestData
+from tradebot.backtesting.engine import BacktestData, ExchangeFilterProvenance
 from tradebot.core.errors import DataError
 from tradebot.core.logging import get_logger
 from tradebot.core.types import Candle, SymbolInfo, Timeframe
@@ -308,12 +308,18 @@ def load_dataset(
             log.warning("symbol_has_no_data", symbol=symbol)
             continue
 
-        info = resolved_infos.get(symbol) or _default_symbol_info(symbol)
+        stored_info = resolved_infos.get(symbol)
+        info = stored_info or _default_symbol_info(symbol)
         out[symbol] = BacktestData(
             symbol=symbol,
             candles=candles,
             symbol_info=info,
             funding_rates=_load_funding(dataset_root, symbol),
+            exchange_filter_provenance=(
+                ExchangeFilterProvenance.GENUINE
+                if stored_info is not None
+                else ExchangeFilterProvenance.PLACEHOLDER
+            ),
         )
 
     total_bars = sum(q.bars for q in reports)

@@ -6,7 +6,7 @@
 
 account:
   # Used for BACKTEST/PAPER. In LIVE the real balance from Binance overrides it.
-  initial_capital: 75.0
+  initial_capital: 200.0
   quote_asset: USDT
 
 risk:
@@ -25,6 +25,10 @@ risk:
   max_total_exposure: 4.0
   # Margin used / equity.
   max_margin_usage: 0.5
+  # Absolute initial-margin caps. Margin is collateral, not permitted loss;
+  # stop-distance risk remains the sizing authority.
+  max_margin_per_trade: 5.0
+  max_total_allocated_margin: 20.0
 
   # Leverage. Never used to enlarge risk — only to make a risk-correct position
   # representable given the account size.

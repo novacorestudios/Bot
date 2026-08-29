@@ -151,6 +151,8 @@ class RejectionReason(StrEnum):
     DIRECTION_EXPOSURE_LIMIT = "DIRECTION_EXPOSURE_LIMIT"
     SYMBOL_EXPOSURE_LIMIT = "SYMBOL_EXPOSURE_LIMIT"
     MARGIN_LIMIT = "MARGIN_LIMIT"
+    PER_TRADE_MARGIN_LIMIT = "PER_TRADE_MARGIN_LIMIT"
+    TOTAL_MARGIN_LIMIT = "TOTAL_MARGIN_LIMIT"
     CORRELATION_LIMIT = "CORRELATION_LIMIT"
     KILL_SWITCH_ACTIVE = "KILL_SWITCH_ACTIVE"
     DAILY_LOSS_LIMIT = "DAILY_LOSS_LIMIT"
@@ -754,6 +756,9 @@ class Position:
     #: When the order was submitted. Between signal_at and opened_at.
     order_at: int = 0
     entry_notional: float = 0.0
+    #: Initial margin committed when the position opened. Unlike ``margin()``,
+    #: this does not move with mark price or unrealized PnL.
+    allocated_initial_margin: float = 0.0
     entry_fee: float = 0.0
     funding_paid: float = 0.0
     entry_slippage: float = 0.0

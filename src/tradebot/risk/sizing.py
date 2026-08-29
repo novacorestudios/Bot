@@ -138,6 +138,7 @@ class PositionSizer:
         direction: Direction,
         symbol_info: SymbolInfo,
         available_margin: float | None = None,
+        total_margin_available: float | None = None,
         volatility: float = 0.0,
         max_notional: float | None = None,
     ) -> SizingResult:
@@ -236,12 +237,53 @@ class PositionSizer:
         actual_risk = quantity * stop_distance
 
         # -- leverage -------------------------------------------------------- #
-        margin_budget = (
+        balance_margin_budget = (
             available_margin if available_margin is not None else equity * cfg.max_margin_usage
+        )
+        total_margin_budget = (
+            total_margin_available
+            if total_margin_available is not None
+            else cfg.max_total_allocated_margin
+        )
+        margin_budget = max(
+            0.0,
+            min(balance_margin_budget, cfg.max_margin_per_trade, total_margin_budget),
         )
         needed_leverage = self.required_leverage(notional, margin_budget)
         volatility_ceiling = self.volatility_adjusted_max_leverage(volatility)
-        leverage = min(needed_leverage, volatility_ceiling, symbol_info.max_leverage)
+        absolute_leverage_ceiling = min(cfg.max_leverage, symbol_info.max_leverage)
+        required_margin_at_absolute_ceiling = notional / max(1, absolute_leverage_ceiling)
+
+        if required_margin_at_absolute_ceiling > cfg.max_margin_per_trade:
+            return observed(
+                SizingResult.reject(
+                    RejectionReason.PER_TRADE_MARGIN_LIMIT,
+                    f"risk-correct position needs at least "
+                    f"{required_margin_at_absolute_ceiling:.4f} margin at "
+                    f"{absolute_leverage_ceiling}x, above the per-trade cap "
+                    f"{cfg.max_margin_per_trade:.4f}",
+                    margin_required=required_margin_at_absolute_ceiling,
+                    margin_cap=cfg.max_margin_per_trade,
+                    leverage_ceiling=float(absolute_leverage_ceiling),
+                )
+            )
+        if (
+            total_margin_available is not None
+            and required_margin_at_absolute_ceiling > total_margin_available
+        ):
+            return observed(
+                SizingResult.reject(
+                    RejectionReason.TOTAL_MARGIN_LIMIT,
+                    f"risk-correct position needs at least "
+                    f"{required_margin_at_absolute_ceiling:.4f} margin but only "
+                    f"{max(0.0, total_margin_available):.4f} remains under the total cap",
+                    margin_required=required_margin_at_absolute_ceiling,
+                    total_margin_available=max(0.0, total_margin_available),
+                    total_margin_cap=cfg.max_total_allocated_margin,
+                )
+            )
+
+        leverage = min(needed_leverage, volatility_ceiling, absolute_leverage_ceiling)
         leverage = max(cfg.min_leverage, leverage)
 
         if needed_leverage > volatility_ceiling:
@@ -267,13 +309,35 @@ class PositionSizer:
             )
 
         margin_required = notional / leverage
-        if margin_budget > 0 and margin_required > margin_budget:
+        if margin_required > cfg.max_margin_per_trade:
+            return observed(
+                SizingResult.reject(
+                    RejectionReason.PER_TRADE_MARGIN_LIMIT,
+                    f"margin {margin_required:.4f} exceeds the per-trade cap "
+                    f"{cfg.max_margin_per_trade:.4f}",
+                    margin_required=margin_required,
+                    margin_cap=cfg.max_margin_per_trade,
+                )
+            )
+        if total_margin_available is not None and margin_required > total_margin_available:
+            return observed(
+                SizingResult.reject(
+                    RejectionReason.TOTAL_MARGIN_LIMIT,
+                    f"margin {margin_required:.4f} exceeds the "
+                    f"{max(0.0, total_margin_available):.4f} remaining total allocation",
+                    margin_required=margin_required,
+                    total_margin_available=max(0.0, total_margin_available),
+                    total_margin_cap=cfg.max_total_allocated_margin,
+                )
+            )
+        if margin_required > balance_margin_budget:
             return observed(
                 SizingResult.reject(
                     RejectionReason.MARGIN_LIMIT,
-                    f"margin {margin_required:.4f} exceeds the available {margin_budget:.4f}",
+                    f"margin {margin_required:.4f} exceeds the available "
+                    f"{max(0.0, balance_margin_budget):.4f}",
                     margin_required=margin_required,
-                    margin_budget=margin_budget,
+                    margin_budget=max(0.0, balance_margin_budget),
                 )
             )
 
@@ -313,6 +377,9 @@ class PositionSizer:
                     "risk_fraction_used": safe_div(actual_risk, equity, 0.0),
                     "budgeted_risk": risk_amount,
                     "needed_leverage": float(needed_leverage),
+                    "margin_required": margin_required,
+                    "margin_per_trade_cap": cfg.max_margin_per_trade,
+                    "total_margin_available": max(0.0, total_margin_budget),
                     "volatility_ceiling": float(volatility_ceiling),
                     "maintenance_rate": maintenance_rate,
                 },

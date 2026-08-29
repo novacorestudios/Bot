@@ -41,7 +41,7 @@ class _Model(BaseModel):
 # Tunable sections
 # --------------------------------------------------------------------------- #
 class AccountConfig(_Model):
-    initial_capital: float = Field(75.0, gt=0)
+    initial_capital: float = Field(200.0, gt=0)
     quote_asset: str = "USDT"
 
 
@@ -56,6 +56,8 @@ class RiskConfig(_Model):
     max_direction_exposure: float = Field(3.0, gt=0)
     max_total_exposure: float = Field(4.0, gt=0)
     max_margin_usage: float = Field(0.5, gt=0, le=1.0)
+    max_margin_per_trade: float = Field(5.0, gt=0)
+    max_total_allocated_margin: float = Field(20.0, gt=0)
 
     max_leverage: int = Field(5, ge=1, le=125)
     min_leverage: int = Field(1, ge=1)
@@ -82,6 +84,8 @@ class RiskConfig(_Model):
             raise ValueError("risk_per_trade outside [min_risk_per_trade, max_risk_per_trade]")
         if self.min_leverage > self.max_leverage:
             raise ValueError("min_leverage exceeds max_leverage")
+        if self.max_margin_per_trade > self.max_total_allocated_margin:
+            raise ValueError("max_margin_per_trade exceeds max_total_allocated_margin")
         if self.max_hourly_loss > self.max_daily_loss:
             raise ValueError("max_hourly_loss exceeds max_daily_loss")
         if self.max_daily_loss > self.max_drawdown:

@@ -286,6 +286,7 @@ class ExecutionEngine:
             regime=intent.regime,
             opened_at=self.clock.now_ms(),
             entry_notional=order.filled_quantity * fill_price,
+            allocated_initial_margin=order.filled_quantity * fill_price / max(1, applied_leverage),
             entry_fee=order.total_commission,
             entry_slippage=slippage * order.filled_quantity * fill_price,
             initial_stop=intent.stop_loss,
@@ -404,6 +405,7 @@ class ExecutionEngine:
                 regime=intent.regime,
                 opened_at=self.clock.now_ms(),
                 entry_notional=order.filled_quantity * price,
+                allocated_initial_margin=order.filled_quantity * price / max(1, intent.leverage),
                 entry_fee=order.total_commission,
                 initial_stop=intent.stop_loss,
             )

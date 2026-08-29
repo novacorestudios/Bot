@@ -16,7 +16,11 @@ from tradebot.core.types import TradingMode
 
 class TestShippedConfig:
     def test_default_config_is_valid(self, tunables):
-        assert tunables.account.initial_capital == 75.0
+        assert tunables.account.initial_capital == 200.0
+        assert tunables.risk.max_margin_per_trade == 5.0
+        assert tunables.risk.max_total_allocated_margin == 20.0
+        assert tunables.risk.max_leverage == 5
+        assert tunables.risk.max_concurrent_positions == 4
         assert tunables.scanner.top_markets == 25
         assert tunables.trade.max_duration_sec <= 3600
 

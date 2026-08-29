@@ -47,6 +47,7 @@ from __future__ import annotations
 import time
 from bisect import bisect_right
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 import numpy as np
@@ -88,6 +89,13 @@ from tradebot.strategies.registry import StrategyRegistry
 log = get_logger(__name__)
 
 
+class ExchangeFilterProvenance(StrEnum):
+    """Whether a symbol's trading filters came from stored exchangeInfo."""
+
+    GENUINE = "GENUINE_EXCHANGE_INFO"
+    PLACEHOLDER = "PLACEHOLDER"
+
+
 @dataclass(slots=True)
 class BacktestData:
     """Historical bars for one symbol across the timeframes the engine needs."""
@@ -96,6 +104,7 @@ class BacktestData:
     candles: dict[str, list[Candle]]
     symbol_info: SymbolInfo
     funding_rates: dict[int, float] = field(default_factory=dict)
+    exchange_filter_provenance: ExchangeFilterProvenance = ExchangeFilterProvenance.GENUINE
 
     def primary(self, timeframe: str) -> list[Candle]:
         return self.candles.get(timeframe, [])
@@ -670,9 +679,6 @@ class BacktestEngine:
 
         self.balance -= fee
         slippage_cost = fill.slippage_cost
-        self.cost_breakdown.spread_cost += fill.spread_cost
-        self.cost_breakdown.latency_cost += fill.latency_cost
-
         # §35: what the edge model assumed this leg would cost, versus what it did.
         self.execution_quality.record(
             ExecutionRecord(
@@ -707,6 +713,7 @@ class BacktestEngine:
             signal_at=timestamp,
             order_at=timestamp,
             entry_notional=notional,
+            allocated_initial_margin=margin,
             entry_fee=fee,
             entry_slippage=slippage_cost,
             initial_stop=intent.stop_loss,
@@ -935,9 +942,6 @@ class BacktestEngine:
         )
         filled = fill.price if fill.filled else exit_price
         slippage_cost = fill.slippage_cost
-        self.cost_breakdown.spread_cost += fill.spread_cost
-        self.cost_breakdown.latency_cost += fill.latency_cost
-
         # -- the cost ledger -------------------------------------------------
         # One accounting, computed once, so nothing downstream can double-count.
         #
@@ -1199,10 +1203,11 @@ class BacktestEngine:
         }
 
     def _margin_used(self) -> float:
-        prices = self._prices()
         return sum(
-            position.margin(prices.get(symbol, position.entry_price))
-            for symbol, position in self.positions.items()
+            position.allocated_initial_margin
+            if position.allocated_initial_margin > 0
+            else position.entry_notional / max(1, position.leverage)
+            for position in self.positions.values()
         )
 
     def _record_equity(self, data: dict[str, BacktestData], timestamp: int) -> None:

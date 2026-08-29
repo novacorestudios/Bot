@@ -15,7 +15,7 @@ import textwrap
 import pytest
 
 from tradebot.backtesting.data import load_dataset
-from tradebot.backtesting.engine import BacktestData, BacktestEngine
+from tradebot.backtesting.engine import BacktestData, BacktestEngine, ExchangeFilterProvenance
 from tradebot.backtesting.runner import EdgeMode, OOSMode, run_strict_oos
 from tradebot.backtesting.trust import TrustLevel, evaluate_trust
 from tradebot.core.config import load_tunables
@@ -251,6 +251,63 @@ class TestIssue3RealExchangeInfo:
         )
         assert report.level is TrustLevel.UNTRUSTED
         assert any("exchangeInfo" in d for d in report.downgrades)
+
+
+class TestPerSymbolExchangeFilterProvenance:
+    @staticmethod
+    def _two_symbol_dataset(tmp_path, stored_symbols: set[str]):
+        store = DataStore(tmp_path)
+        for symbol in ("BTCUSDT", "DELISTEDUSDT"):
+            store.write_klines(symbol, "5m", bars(20, 300_000), source="test")
+        if stored_symbols:
+            store.write_exchange_info(
+                {symbol: info(symbol) for symbol in stored_symbols}, source="current exchangeInfo"
+            )
+        return load_dataset(tmp_path, ["BTCUSDT", "DELISTEDUSDT"], ["5m"], strict=False)
+
+    def test_full_coverage_is_trusted(self, tmp_path) -> None:
+        data, quality = self._two_symbol_dataset(tmp_path, {"BTCUSDT", "DELISTEDUSDT"})
+        report = evaluate_trust(data, quality, ["5m"], False, True)
+
+        assert report.level is TrustLevel.TRUSTED
+        assert report.placeholder_filter_symbols == []
+        assert all(
+            entry.exchange_filter_provenance is ExchangeFilterProvenance.GENUINE
+            for entry in data.values()
+        )
+
+    def test_partial_coverage_lists_the_placeholder_symbol(self, tmp_path) -> None:
+        data, quality = self._two_symbol_dataset(tmp_path, {"BTCUSDT"})
+        report = evaluate_trust(data, quality, ["5m"], False, True)
+
+        assert report.level is TrustLevel.UNTRUSTED
+        assert report.placeholder_filter_symbols == ["DELISTEDUSDT"]
+        assert "DELISTEDUSDT" in "\n".join(report.lines())
+        assert report.as_dict()["exchange_filter_fidelity"] == {
+            "trusted": False,
+            "placeholder_symbols": ["DELISTEDUSDT"],
+        }
+
+    def test_zero_coverage_lists_every_affected_symbol(self, tmp_path) -> None:
+        data, quality = self._two_symbol_dataset(tmp_path, set())
+        report = evaluate_trust(data, quality, ["5m"], False, False)
+
+        assert report.level is TrustLevel.UNTRUSTED
+        assert report.placeholder_filter_symbols == ["BTCUSDT", "DELISTEDUSDT"]
+        assert all(
+            entry.exchange_filter_provenance is ExchangeFilterProvenance.PLACEHOLDER
+            for entry in data.values()
+        )
+
+    def test_historical_delisted_symbol_is_not_covered_by_current_snapshot(self, tmp_path) -> None:
+        data, quality = self._two_symbol_dataset(tmp_path, {"BTCUSDT"})
+
+        historical = data["DELISTEDUSDT"]
+        assert historical.symbol_info.tick_size == 1e-8  # diagnostic placeholder remains usable
+        assert historical.exchange_filter_provenance is ExchangeFilterProvenance.PLACEHOLDER
+        report = evaluate_trust(data, quality, ["5m"], False, True)
+        assert not report.is_trusted
+        assert report.placeholder_filter_symbols == ["DELISTEDUSDT"]
 
 
 class TestIssue4EquityMarkingTiming:
