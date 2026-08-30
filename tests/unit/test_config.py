@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from tradebot.core.config import (
+    RiskConfig,
     Settings,
     enforce_live_gate,
     load_tunables,
@@ -54,6 +55,32 @@ class TestShippedConfig:
 
     def test_max_trade_duration_never_exceeds_sixty_minutes(self, tunables):
         assert tunables.trade.max_duration_sec <= 3600
+
+
+class TestExpectedEdgeNotional:
+    def test_target_account_is_capped_at_executable_notional(self):
+        risk = RiskConfig(
+            max_symbol_exposure=1.0,
+            max_margin_per_trade=5.0,
+            max_leverage=5,
+        )
+        assert risk.expected_edge_notional(200.0) == 25.0
+
+    def test_more_equity_does_not_exceed_executable_notional(self):
+        risk = RiskConfig(
+            max_symbol_exposure=1.0,
+            max_margin_per_trade=5.0,
+            max_leverage=5,
+        )
+        assert risk.expected_edge_notional(10_000.0) == 25.0
+
+    def test_smaller_exposure_estimate_is_not_increased(self):
+        risk = RiskConfig(
+            max_symbol_exposure=0.1,
+            max_margin_per_trade=5.0,
+            max_leverage=5,
+        )
+        assert risk.expected_edge_notional(200.0) == 20.0
 
 
 class TestValidation:

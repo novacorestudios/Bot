@@ -62,6 +62,7 @@ from tradebot.backtesting.execution import (
 from tradebot.backtesting.metrics import BacktestMetrics, EquityPoint, compute_metrics
 from tradebot.core.clock import SystemClock
 from tradebot.core.config import TunableConfig
+from tradebot.core.diagnostics import aggregate_rejections
 from tradebot.core.logging import get_logger
 from tradebot.core.mathutil import from_bps, round_quantity, safe_div
 from tradebot.core.types import (
@@ -118,6 +119,7 @@ class BacktestResult:
     rejections: dict[str, int]
     bars_processed: int
     duration_sec: float
+    rejections_by_stage: dict[str, dict[str, int]] = field(default_factory=dict)
     config_snapshot: dict[str, Any] = field(default_factory=dict)
     start_ms: int = 0
     end_ms: int = 0
@@ -557,7 +559,7 @@ class BacktestEngine:
             view,
             market,
             liquidity,
-            self.equity * self.config.risk.max_symbol_exposure,
+            self.config.risk.expected_edge_notional(self.equity),
             correlation=self._correlation_penalty(symbol),
             strategy_allocation=self.risk.strategy_weights(list(self.registry.strategies)),
             seconds_to_funding=self._seconds_to_funding(data, timestamp),
@@ -1286,13 +1288,17 @@ class BacktestEngine:
         period = self._equity_sampling_sec()
 
         metrics = compute_metrics(self.trades, self.equity_curve, self.initial_capital, period)
+        rejections, rejections_by_stage = aggregate_rejections(
+            self.pipeline.rejections, self.risk.rejections
+        )
         return BacktestResult(
             metrics=metrics,
             trades=self.trades,
             equity_curve=self.equity_curve,
-            rejections={**self.pipeline.rejections, **self.risk.rejections},
+            rejections=rejections,
             bars_processed=self.bars_processed,
             duration_sec=time.time() - started,
+            rejections_by_stage=rejections_by_stage,
             config_snapshot={
                 "risk_per_trade": self.config.risk.risk_per_trade,
                 "min_expected_edge": self.config.edge.min_expected_edge,

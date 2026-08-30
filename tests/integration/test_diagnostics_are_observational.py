@@ -20,6 +20,7 @@ import pytest
 from tradebot.backtesting.diagnostics import CandidateRecorder
 from tradebot.backtesting.engine import BacktestData, BacktestEngine
 from tradebot.core.config import load_tunables
+from tradebot.core.diagnostics import aggregate_rejections
 from tradebot.core.types import Candle, Direction, SymbolInfo
 from tradebot.risk.sizing import PositionSizer, SizingResult
 
@@ -129,6 +130,28 @@ class TestTheRecorderChangesNothing:
         plain, _ = run(dataset, None)
         observed, _ = run(dataset, CandidateRecorder())
         assert observed.rejections == plain.rejections
+
+    def test_same_reason_at_two_stages_is_summed_and_attributed(self) -> None:
+        reason = "LOW_OPPORTUNITY_SCORE"
+        aggregate, by_stage = aggregate_rejections({reason: 7}, {reason: 3})
+
+        assert aggregate[reason] == 10
+        assert by_stage == {
+            "pipeline": {reason: 7},
+            "risk": {reason: 3},
+        }
+
+    def test_backtest_result_preserves_stage_rejection_counts(self) -> None:
+        reason = "LOW_OPPORTUNITY_SCORE"
+        engine = BacktestEngine(CONFIG)
+        engine.pipeline.rejections[reason] = 7
+        engine.risk.rejections[reason] = 3
+
+        result = engine._result(0.0, START, START)
+
+        assert result.rejections[reason] == 10
+        assert result.rejections_by_stage["pipeline"][reason] == 7
+        assert result.rejections_by_stage["risk"][reason] == 3
 
     def test_the_equity_curve_is_identical(self, dataset) -> None:
         plain, _ = run(dataset, None)

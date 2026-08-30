@@ -30,6 +30,7 @@ from typing import Any
 
 from tradebot.core.clock import SystemClock, format_duration
 from tradebot.core.config import AppConfig
+from tradebot.core.diagnostics import aggregate_rejections
 from tradebot.core.events import Event, EventBus, EventType
 from tradebot.core.logging import get_logger
 from tradebot.core.types import (
@@ -663,7 +664,7 @@ class TradingEngine:
                 view,
                 candidate.market_score,
                 liquidity,
-                notional_estimate=self.equity * self.tunables.risk.max_symbol_exposure,
+                notional_estimate=self.tunables.risk.expected_edge_notional(self.equity),
                 correlation=self.scanner.correlation_penalties.get(symbol, 0.0),
                 strategy_allocation=self.risk.strategy_weights(list(self.registry.strategies)),
                 seconds_to_funding=self._seconds_to_funding(mark),
@@ -1255,7 +1256,9 @@ class TradingEngine:
                 symbol_info=None,  # type: ignore[arg-type]
             )
         )
-        rejections = {**self.pipeline.rejections, **self.risk.rejections}
+        rejections, rejections_by_stage = aggregate_rejections(
+            self.pipeline.rejections, self.risk.rejections
+        )
 
         return {
             "mode": self.config.mode.value,
@@ -1290,6 +1293,7 @@ class TradingEngine:
                 {"reason": reason, "count": count}
                 for reason, count in sorted(rejections.items(), key=lambda kv: -kv[1])[:12]
             ],
+            "rejections_by_stage": rejections_by_stage,
         }
 
     def open_positions_view(self) -> list[dict[str, Any]]:

@@ -211,6 +211,7 @@ class BacktestReport:
             ),
             "edge_calibration": edge_calibration(trades),
             "rejections": dict(sorted(result.rejections.items(), key=lambda kv: -kv[1])),
+            "rejections_by_stage": result.rejections_by_stage,
             "liquidations": result.liquidations,
             "missing_timeframes": result.missing_timeframes or None,
             "bootstrap": {

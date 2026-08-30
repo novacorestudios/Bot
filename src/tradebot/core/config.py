@@ -76,6 +76,17 @@ class RiskConfig(_Model):
     max_consecutive_losses: int = Field(5, ge=1)
     day_reset_hour_utc: int = Field(0, ge=0, le=23)
 
+    def expected_edge_notional(self, equity: float) -> float:
+        """Largest notional the pre-trade cost model should price.
+
+        The exposure ceiling can be much larger than the position that the
+        absolute margin and leverage controls can actually admit. Costing that
+        impossible size overstates market impact and rejects the wrong trade.
+        """
+        exposure_estimate = equity * self.max_symbol_exposure
+        executable_cap = self.max_margin_per_trade * self.max_leverage
+        return min(exposure_estimate, executable_cap)
+
     @model_validator(mode="after")
     def _coherent(self) -> RiskConfig:
         if self.min_risk_per_trade > self.max_risk_per_trade:

@@ -71,6 +71,14 @@ class TestNonNegotiableRules:
         assert "RiskEngine(" in backtest_init
         assert "PositionSizer(" in risk_init
 
+    def test_live_paper_and_backtest_cost_the_executable_notional(self):
+        """Both decision paths must use the shared capped edge estimate."""
+        runner_evaluate = inspect.getsource(TradingEngine._evaluate_candidates)
+        backtest_evaluate = inspect.getsource(BacktestEngine._evaluate)
+
+        assert "risk.expected_edge_notional(self.equity)" in runner_evaluate
+        assert "risk.expected_edge_notional(self.equity)" in backtest_evaluate
+
     def test_strategies_cannot_reach_the_account_or_exchange(self):
         """Rule 4, again: MarketView carries nothing actionable."""
         fields = set(MarketView.__slots__)
