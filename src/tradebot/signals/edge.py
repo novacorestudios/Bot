@@ -36,6 +36,7 @@ trade, and the backtester measures the real distribution afterwards.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import sqrt
 
 from tradebot.core.config import EdgeConfig
 from tradebot.core.logging import get_logger
@@ -95,6 +96,7 @@ class EdgeDecision:
     threshold: float
     detail: str = ""
     inputs: dict[str, float] = field(default_factory=dict)
+    context_key: str = ""
 
     @property
     def expected_net(self) -> float:
@@ -108,6 +110,9 @@ class EdgeCalculator:
         self.config = config
         self.cost_model = cost_model
         self._stats: dict[str, StrategyStats] = {}
+        self._context_stats: dict[str, StrategyStats] = {}
+        self._learning_frozen = False
+        self._bootstrap_allowed = True
         #: How many edge estimates used an ASSUMED win rate rather than a
         #: measured one. Reported so a backtest result cannot be mistaken for
         #: evidence when it in fact rests on assumptions.
@@ -131,8 +136,64 @@ class EdgeCalculator:
         gross_return: float,
         expected_edge: float,
         realised_edge: float,
+        *,
+        target_before_stop: bool | None = None,
+        context_key: str = "",
     ) -> None:
-        self.stats_for(strategy).record(won, gross_return, expected_edge, realised_edge)
+        if self._learning_frozen:
+            return
+        outcome = won if target_before_stop is None else target_before_stop
+        self.stats_for(strategy).record(outcome, gross_return, expected_edge, realised_edge)
+        if context_key:
+            stats = self._context_stats.setdefault(context_key, StrategyStats())
+            stats.record(
+                outcome,
+                gross_return,
+                expected_edge,
+                realised_edge,
+            )
+
+    def freeze_learning(self) -> None:
+        """Prevent an evaluation window from training on its own outcomes."""
+        self._learning_frozen = True
+
+    def disable_bootstrap(self) -> None:
+        """Forbid assumed probabilities in validation, OOS, paper and live evidence."""
+        self._bootstrap_allowed = False
+
+    @staticmethod
+    def context_key(signal: AggregatedSignal, liquidity: LiquiditySnapshot) -> str:
+        """Stable, intentionally coarse setup bucket used for empirical edge."""
+        spread_bucket = (
+            "tight"
+            if liquidity.spread_bps <= 2.0
+            else "normal"
+            if liquidity.spread_bps <= 4.0
+            else "wide"
+        )
+        return "|".join(
+            (
+                signal.primary_strategy,
+                signal.regime.value,
+                signal.direction.value,
+                spread_bucket,
+            )
+        )
+
+    def conservative_probability(self, stats: StrategyStats, prior: float) -> float:
+        """Lower confidence bound of the prior-shrunk Bernoulli posterior."""
+        weight = self.config.win_rate_prior_weight
+        n = stats.trades + weight
+        if n <= 0:
+            return prior
+        p = (stats.wins + prior * weight) / n
+        z = self.config.confidence_lower_bound_z
+        if z <= 0:
+            return clamp(p, 0.01, 0.99)
+        denominator = 1.0 + z * z / n
+        centre = p + z * z / (2.0 * n)
+        radius = z * sqrt((p * (1.0 - p) + z * z / (4.0 * n)) / n)
+        return clamp((centre - radius) / denominator, 0.01, 0.99)
 
     def win_probability(self, strategy: str, reward_risk: float = 0.0) -> float:
         """Shrunk estimate of P(target before stop), from realised history.
@@ -157,6 +218,23 @@ class EdgeCalculator:
 
         blended = (stats.wins + prior * prior_weight) / (stats.trades + prior_weight)
         return clamp(blended, 0.01, 0.99)
+
+    def contextual_win_probability(
+        self, strategy: str, context_key: str, reward_risk: float = 0.0
+    ) -> float:
+        """Use setup evidence only when it is large enough to be meaningful."""
+        pooled = self.win_probability(strategy, reward_risk)
+        stats = self._context_stats.get(context_key)
+        if (
+            not self.config.contextual_enabled
+            or stats is None
+            or stats.trades < self.config.contextual_min_trades
+        ):
+            pooled_stats = self.stats_for(strategy)
+            if pooled_stats.trades < self.config.contextual_min_trades:
+                return pooled
+            return self.conservative_probability(pooled_stats, self.config.win_rate_prior)
+        return self.conservative_probability(stats, pooled)
 
     def bootstrap_probability(
         self, strategy: str, gross_win: float, gross_loss: float, cost_total: float
@@ -198,7 +276,8 @@ class EdgeCalculator:
     def uses_bootstrap(self, strategy: str) -> bool:
         """Whether this strategy's estimate would rest on an assumption."""
         return (
-            self.config.bootstrap_enabled
+            self._bootstrap_allowed
+            and self.config.bootstrap_enabled
             and self.stats_for(strategy).trades < self.config.bootstrap_min_trades
         )
 
@@ -230,10 +309,11 @@ class EdgeCalculator:
         # strategy than the one the trade was booked against whenever the
         # aggregator's tuple order differed from confidence order.
         name = strategy or signal.primary_strategy
+        context_key = self.context_key(signal, liquidity)
         p = (
             win_probability
             if win_probability is not None
-            else self.win_probability(name, reward_risk)
+            else self.contextual_win_probability(name, context_key, reward_risk)
         )
 
         costs = self.cost_model.estimate(
@@ -252,7 +332,7 @@ class EdgeCalculator:
         elif self.uses_bootstrap(name):
             p = self.bootstrap_probability(name, gross_win, gross_loss, costs.total)
         else:
-            p = self.win_probability(name, reward_risk)
+            p = self.contextual_win_probability(name, context_key, reward_risk)
 
         expected_gross = p * gross_win - (1.0 - p) * gross_loss
         # Funding can be negative (received), so it is added rather than
@@ -281,6 +361,7 @@ class EdgeCalculator:
     ) -> EdgeDecision:
         """Estimate the edge and apply the minimum-edge threshold."""
         estimate = self.estimate(signal, liquidity, notional, **kwargs)  # type: ignore[arg-type]
+        context_key = self.context_key(signal, liquidity)
         threshold = self.config.min_expected_edge
         accepted = estimate.expected_net > threshold
 
@@ -305,6 +386,7 @@ class EdgeCalculator:
                 "depth_notional": liquidity.depth_notional,
                 "reward_risk": safe_div(estimate.gross_win, estimate.gross_loss, 0.0),
             },
+            context_key=context_key,
         )
 
     # ------------------------------------------------------------------ #
@@ -351,7 +433,7 @@ class EdgeCalculator:
         trading: live never bootstraps, so it must START from evidence rather
         than gather it with real money.
         """
-        return {
+        exported = {
             name: {
                 "trades": stats.trades,
                 "wins": stats.wins,
@@ -360,11 +442,24 @@ class EdgeCalculator:
             }
             for name, stats in self._stats.items()
         }
+        for key, stats in self._context_stats.items():
+            exported[f"context::{key}"] = {
+                "trades": stats.trades,
+                "wins": stats.wins,
+                "gross_win_sum": stats.gross_win_sum,
+                "gross_loss_sum": stats.gross_loss_sum,
+            }
+        return exported
 
     def seed_from(self, exported: dict[str, dict[str, float]]) -> None:
         """Load measured statistics produced by a previous validated run."""
         for name, values in exported.items():
-            stats = self.stats_for(name)
+            if name.startswith("context::"):
+                stats = self._context_stats.setdefault(
+                    name.removeprefix("context::"), StrategyStats()
+                )
+            else:
+                stats = self.stats_for(name)
             stats.trades = int(values.get("trades", 0))
             stats.wins = int(values.get("wins", 0))
             stats.gross_win_sum = float(values.get("gross_win_sum", 0.0))

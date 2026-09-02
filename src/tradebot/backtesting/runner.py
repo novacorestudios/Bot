@@ -316,10 +316,9 @@ def run_strict_oos(
     history. Those statistics are then **seeded into a fresh engine** which runs
     only the test period.
 
-    The test engine keeps updating as it goes, exactly as a deployed system
-    would from that starting point — what it cannot do is have learned from the
-    test period *before* trading it, which is precisely what a single continuous
-    run lets happen.
+    The test engine is frozen: its outcomes cannot improve its own probability
+    estimate, and bootstrap assumptions are forbidden. This makes the holdout a
+    measurement of training evidence rather than a second training period.
     """
     train_engine = BacktestEngine(config, initial_capital)
     train = train_engine.run(data, start_ms, split_ms, seed=seed)
@@ -328,6 +327,8 @@ def run_strict_oos(
 
     test_engine = BacktestEngine(config, initial_capital)
     test_engine.pipeline.edge_calculator.seed_from(frozen)
+    test_engine.pipeline.edge_calculator.disable_bootstrap()
+    test_engine.pipeline.edge_calculator.freeze_learning()
     test = test_engine.run(data, split_ms, end_ms, seed=seed)
 
     log.info(

@@ -34,7 +34,7 @@ Binance WebSocket + REST → MarketState (freshness per symbol)
   → execution-quality feedback → performance database
 ```
 
-Two properties are worth stating up front, because they are what the design is
+Four properties are worth stating up front, because they are what the design is
 actually for:
 
 1. **It does not force trades.** There is no trades-per-hour target. If the
@@ -43,6 +43,15 @@ actually for:
 2. **Nothing bypasses the risk engine.** Strategies return data, never orders.
    The AI layer is advisory and has no order path. Exactly one code path turns
    an opportunity into an order, and it is inside `risk/engine.py`.
+
+3. **Edge evidence is contextual and conservative.** Target-before-stop
+   outcomes are tracked separately for each strategy/regime/direction/spread
+   bucket. Sparse buckets fall back to pooled evidence, and sufficiently sized
+   samples use a lower confidence bound rather than the flattering mean.
+
+4. **OOS means frozen.** Strict holdout and walk-forward test windows inherit
+   training evidence, disable bootstrap assumptions, and cannot learn from
+   their own outcomes.
 
 ## Three things worth knowing before you start
 

@@ -418,6 +418,7 @@ class RiskEngine:
                 "primary_strategy": signal.primary_strategy,
                 "contributing_strategies": list(signal.contributing_strategies),
                 "contribution_weights": signal.contribution_weights,
+                "edge_context_key": opportunity.edge.context_key,
                 "strategies": list(signal.strategies),
                 "consensus_score": signal.consensus_score,
             },

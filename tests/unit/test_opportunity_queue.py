@@ -103,6 +103,13 @@ def queue(clock: VirtualClock) -> OpportunityQueue:
 
 
 class TestOrdering:
+    def test_expected_net_dollars_lead_score(self, queue: OpportunityQueue) -> None:
+        high_score = make_opportunity("PRETTY", score=95.0, edge=0.001)
+        high_value = make_opportunity("VALUE", score=75.0, edge=0.003)
+        queue.add(high_score)
+        queue.add(high_value)
+        assert queue.best().symbol == "VALUE"  # type: ignore[union-attr]
+
     def test_the_best_score_is_taken_first_regardless_of_insertion_order(
         self, queue: OpportunityQueue
     ) -> None:

@@ -425,6 +425,45 @@ class TestEdgeCalculation:
         report = calc.realised_vs_expected("optimistic")
         assert report["gap"] == pytest.approx(-0.0015, abs=1e-6)
 
+    def test_target_before_stop_not_net_profit_trains_probability(self):
+        calc = self.calculator()
+        for _ in range(25):
+            calc.record_result(
+                "momentum",
+                won=True,
+                gross_return=0.001,
+                expected_edge=0.001,
+                realised_edge=0.0001,
+                target_before_stop=False,
+            )
+        assert calc.stats_for("momentum").wins == 0
+
+    def test_context_evidence_is_separate_and_conservative(self):
+        calc = self.calculator(contextual_min_trades=5, confidence_lower_bound_z=1.0)
+        signal = aggregated()
+        key = calc.context_key(signal, LIQUID)
+        for _ in range(10):
+            calc.record_result(
+                "momentum",
+                True,
+                0.01,
+                0.001,
+                0.001,
+                target_before_stop=True,
+                context_key=key,
+            )
+        contextual = calc.contextual_win_probability("momentum", key)
+        assert contextual < calc.stats_for("momentum").observed_win_rate
+        assert f"context::{key}" in calc.export_stats()
+
+    def test_frozen_evaluation_cannot_learn_or_bootstrap(self):
+        calc = self.calculator(bootstrap_enabled=True, bootstrap_min_trades=30)
+        calc.disable_bootstrap()
+        calc.freeze_learning()
+        calc.record_result("momentum", True, 0.01, 0.001, 0.001)
+        assert calc.stats_for("momentum").trades == 0
+        assert not calc.uses_bootstrap("momentum")
+
     def test_threshold_is_configurable(self):
         strict = self.calculator(min_expected_edge=0.01)
         self.proven(strict)

@@ -83,6 +83,9 @@ class TradingEngine:
         self.cost_model = CostModel(self.tunables.edge)
         self.registry = StrategyRegistry.from_config(self.tunables)
         self.pipeline = SignalPipeline(self.tunables, self.registry, self.cost_model)
+        # PAPER and LIVE may consume validated evidence, but may never create
+        # trades from the research-only break-even-plus-margin assumption.
+        self.pipeline.edge_calculator.disable_bootstrap()
         self.risk = RiskEngine(self.tunables, self.candles, self.clock)
         # Exit conditions the exchange cannot see: the clock, the regime, a
         # flipped signal, an evaporated edge, and a stop that is no longer there.
@@ -1154,6 +1157,8 @@ class TradingEngine:
             else 0.0,
             expected_edge=trade.expected_net_edge,
             realised_edge=realised_edge,
+            target_before_stop=trade.exit_reason is ExitReason.TAKE_PROFIT,
+            context_key=str(trade.metadata.get("edge_context_key", "")),
         )
 
         if self.repository is not None:

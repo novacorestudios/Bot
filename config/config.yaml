@@ -273,6 +273,11 @@ edge:
   # historical win rate, shrunk toward this prior until enough samples exist.
   win_rate_prior: 0.45
   win_rate_prior_weight: 40.0
+  # Require evidence for the actual strategy/regime/direction/spread setup.
+  contextual_enabled: true
+  contextual_min_trades: 20
+  # Use a conservative one-sided probability bound after enough observations.
+  confidence_lower_bound_z: 1.0
 
 trade:
   max_duration_sec: 3600        # hard 60 minute cap

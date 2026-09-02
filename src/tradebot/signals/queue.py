@@ -88,14 +88,14 @@ class QueuedOpportunity:
 def rank_key(entry: QueuedOpportunity) -> tuple[float, float, float]:
     """Best first.
 
-    Score leads because it already folds in market quality, consensus, cost and
-    correlation. Expected net edge breaks ties, because between two equally
-    scored trades the one that keeps more after costs is strictly better.
+    Expected net dollars lead: the queue exists to spend scarce position slots
+    on the largest conservative net value, not on the prettiest indicator
+    score. Score and confidence break ties between economically equal setups.
     Confidence breaks the remaining ties.
     """
     return (
+        -(entry.expected_net_edge * entry.opportunity.notional_estimate),
         -entry.score,
-        -entry.expected_net_edge,
         -entry.opportunity.signal.confidence,
     )
 

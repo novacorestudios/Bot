@@ -733,6 +733,7 @@ class BacktestEngine:
                 "primary_strategy": intent.metadata.get("primary_strategy", intent.strategy),
                 "contributing_strategies": intent.metadata.get("contributing_strategies", []),
                 "contribution_weights": intent.metadata.get("contribution_weights", {}),
+                "edge_context_key": intent.metadata.get("edge_context_key", ""),
             },
         )
         self.positions[intent.symbol] = position
@@ -1029,6 +1030,7 @@ class BacktestEngine:
                 "primary_strategy": position.metadata.get("primary_strategy", position.strategy),
                 "contributing_strategies": position.metadata.get("contributing_strategies", []),
                 "contribution_weights": position.metadata.get("contribution_weights", {}),
+                "edge_context_key": position.metadata.get("edge_context_key", ""),
             },
         )
         self.trades.append(trade)
@@ -1070,6 +1072,8 @@ class BacktestEngine:
             gross_return=safe_div(gross, position.entry_notional, 0.0),
             expected_edge=position.expected_net_edge,
             realised_edge=safe_div(net, position.entry_notional, 0.0),
+            target_before_stop=reason is ExitReason.TAKE_PROFIT,
+            context_key=str(position.metadata.get("edge_context_key", "")),
         )
         _ = data
 

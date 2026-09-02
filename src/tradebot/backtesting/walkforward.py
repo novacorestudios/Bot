@@ -19,13 +19,10 @@ The gap earns its place. Indicators look back hundreds of bars, so a test window
 starting immediately after training would be evaluated partly on indicator state
 computed from training data. The embargo removes that overlap.
 
-**No parameter optimisation is performed anywhere in this module.** Nothing is
-fitted, nothing is searched, nothing is selected. What "train" means here is
-only "the window whose results are used as the in-sample baseline for the
-efficiency ratio" — the strategies run with identical parameters in both
-windows. Automated search over a fixed dataset is precisely how overfitting
-happens, and the brief forbids it; parameter variants must be supplied
-explicitly by a caller who knows what they are doing.
+**No parameter optimisation is performed anywhere in this module.** Strategy
+parameters are identical in both windows. The only learned state is empirical
+edge evidence: training target-before-stop observations are copied into the
+test engine, then frozen. Bootstrap assumptions are forbidden in test windows.
 
 Only the **test** windows count as evidence. Their combined result is the
 closest thing to an honest estimate of forward performance.
@@ -303,14 +300,20 @@ class WalkForwardAnalyzer:
 
         results: list[FoldResult] = []
         for fold in folds:
-            train = self._engine().run(
+            train_engine = self._engine()
+            train = train_engine.run(
                 data, fold.train_start, fold.train_end, self.assumptions, seed=self.seed
             )
             # The parameters are NOT refitted here. Automated search over the
             # training window is exactly how overfitting is manufactured; the
             # training run exists to measure in-sample performance so that
             # efficiency (out-of-sample / in-sample) is meaningful.
-            test = self._engine().run(
+            frozen = train_engine.pipeline.edge_calculator.export_stats()
+            test_engine = self._engine()
+            test_engine.pipeline.edge_calculator.seed_from(frozen)
+            test_engine.pipeline.edge_calculator.disable_bootstrap()
+            test_engine.pipeline.edge_calculator.freeze_learning()
+            test = test_engine.run(
                 data, fold.test_start, fold.test_end, self.assumptions, seed=self.seed
             )
             results.append(FoldResult(fold=fold, train=train, test=test))

@@ -306,6 +306,14 @@ class EdgeConfig(_Model):
     min_expected_edge: float = Field(0.0008, ge=0)
     win_rate_prior: float = Field(0.45, gt=0, lt=1)
     win_rate_prior_weight: float = Field(40.0, ge=0)
+    # Edge is learned for the setup actually being traded, not merely for the
+    # strategy name. Sparse contextual cells fall back to the pooled strategy
+    # posterior until they contain enough target-before-stop observations.
+    contextual_enabled: bool = True
+    contextual_min_trades: int = Field(20, ge=1)
+    # One-sided Wilson lower bound. 1.0 is deliberately conservative without
+    # making a small research account permanently inert.
+    confidence_lower_bound_z: float = Field(1.0, ge=0.0, le=3.0)
 
     # -- bootstrap ---------------------------------------------------------
     # Without history the win probability shrinks to `win_rate_prior`, which at

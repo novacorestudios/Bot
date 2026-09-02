@@ -308,7 +308,7 @@ class PaperBroker:
             entry_order_id=order.client_order_id,
             opportunity_score=intent.opportunity_score,
             expected_net_edge=intent.expected_net_edge,
-            metadata={"margin": margin, "simulated": True},
+            metadata={"margin": margin, "simulated": True, **intent.metadata},
         )
 
         log.info(
