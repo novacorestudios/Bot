@@ -676,6 +676,13 @@ class BacktestEngine:
         fee = fill.fee
         margin = notional / max(1, intent.leverage)
 
+        # Sizing uses the decision price, while a market fill can be slightly
+        # worse.  The hard cap applies to the filled position, not merely the
+        # intent, so never admit a position whose realised initial margin is
+        # above it.
+        if margin > self.config.risk.max_margin_per_trade + 1e-12:
+            return
+
         if margin + fee > self.balance:
             return
 

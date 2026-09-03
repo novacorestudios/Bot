@@ -273,6 +273,25 @@ class ExecutionEngine:
                 f"entry slippage {slippage * 100:.3f}% exceeded the limit", order
             )
 
+        filled_margin = order.filled_quantity * fill_price / max(1, applied_leverage)
+        margin_cap = intent.metadata.get("margin_per_trade_cap")
+        if margin_cap is not None and filled_margin > float(margin_cap) + 1e-12:
+            log.error(
+                "filled_margin_cap_exceeded",
+                symbol=symbol,
+                filled_margin=round(filled_margin, 8),
+                limit=float(margin_cap),
+            )
+            await self._emergency_close(
+                symbol,
+                order,
+                fill_price,
+                intent,
+                ExitReason.RISK_EVENT,
+                "filled initial margin exceeded the per-trade cap",
+            )
+            return ExecutionResult.failure("filled initial margin exceeded the per-trade cap", order)
+
         position = Position(
             position_id=new_id("p_"),
             symbol=symbol,
@@ -286,7 +305,7 @@ class ExecutionEngine:
             regime=intent.regime,
             opened_at=self.clock.now_ms(),
             entry_notional=order.filled_quantity * fill_price,
-            allocated_initial_margin=order.filled_quantity * fill_price / max(1, applied_leverage),
+            allocated_initial_margin=filled_margin,
             entry_fee=order.total_commission,
             entry_slippage=slippage * order.filled_quantity * fill_price,
             initial_stop=intent.stop_loss,

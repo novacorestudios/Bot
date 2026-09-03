@@ -39,7 +39,12 @@ ILLIQUID = LiquiditySnapshot("TESTUSDT", 6.0, 15_000.0, 15_000.0, 0.0, 3e7)
 
 
 def build_pipeline(config=CONFIG) -> SignalPipeline:
-    return SignalPipeline(config, StrategyRegistry.from_config(config), CostModel(config.edge))
+    standard = config.model_copy(
+        update={"trade": config.trade.model_copy(update={"raw_signal_mode": False})}
+    )
+    return SignalPipeline(
+        standard, StrategyRegistry.from_config(standard), CostModel(standard.edge)
+    )
 
 
 def market_score(total: float = 85.0, volatility: float = 0.005) -> MarketScore:
@@ -91,6 +96,21 @@ def trending_view() -> MarketView:
 
 
 class TestPipelineGates:
+    def test_raw_mode_uses_one_signal_and_requested_exit_band(self):
+        config = CONFIG.model_copy(
+            update={"trade": CONFIG.trade.model_copy(update={"raw_signal_mode": True})}
+        )
+        pipeline = SignalPipeline(
+            config, StrategyRegistry.from_config(config), CostModel(config.edge)
+        )
+        result = pipeline.evaluate(trending_view(), market_score(95.0), LIQUID, 25.0)
+        assert result.accepted
+        signal = result.opportunity.signal
+        assert signal.metadata["raw_signal_mode"] is True
+        assert signal.stop_distance / signal.entry_price == pytest.approx(0.05)
+        target_pct = abs(signal.take_profit - signal.entry_price) / signal.entry_price
+        assert 0.0005 <= target_pct <= 0.01
+
     def test_panic_regime_blocks_before_any_strategy_runs(self):
         pipeline = build_pipeline()
         view = build_view(

@@ -235,6 +235,16 @@ class TestStopLossIsMandatory:
 
 
 class TestSlippageProtection:
+    async def test_fill_above_intent_margin_cap_is_closed(self):
+        engine, gateway = build()
+        gateway.fill_price_override["TESTUSDT"] = 100.05
+        capped = intent(quantity=0.1, entry=100.0)
+        capped.metadata["margin_per_trade_cap"] = 5.0
+        result = await engine.open_position(capped)
+        assert not result.success
+        assert "margin" in result.reason
+        assert engine.positions == {}
+
     async def test_a_fill_far_from_the_decision_price_is_closed(self):
         """The edge that justified the trade was priced away before we filled."""
         engine, gateway = build()

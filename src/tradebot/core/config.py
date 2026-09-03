@@ -336,9 +336,19 @@ class EdgeConfig(_Model):
 
 class TradeConfig(_Model):
     max_duration_sec: int = Field(3600, ge=60, le=3600)
+    raw_signal_mode: bool = False
+    raw_stop_pct: float = Field(0.05, gt=0, lt=1)
+    raw_take_profit_min_pct: float = Field(0.0005, gt=0, lt=1)
+    raw_take_profit_max_pct: float = Field(0.01, gt=0, lt=1)
     exit_on_negative_edge: bool = True
     exit_on_regime_change: bool = True
     exit_on_signal_flip: bool = True
+
+    @model_validator(mode="after")
+    def _raw_exit_band(self) -> TradeConfig:
+        if self.raw_take_profit_min_pct > self.raw_take_profit_max_pct:
+            raise ValueError("raw_take_profit_min_pct exceeds raw_take_profit_max_pct")
+        return self
 
 
 class StopsConfig(_Model):

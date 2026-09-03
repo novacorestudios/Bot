@@ -107,6 +107,15 @@ def intent(
 
 
 class TestFills:
+    async def test_fill_above_intent_margin_cap_is_rejected(self):
+        paper, _ = broker()
+        capped = intent(quantity=0.1)
+        capped.metadata["margin_per_trade_cap"] = 4.9
+        order = await paper.place_order(capped)
+        assert order.status is OrderStatus.REJECTED
+        assert "margin" in (order.error or "")
+        assert "TESTUSDT" not in paper.account.positions
+
     async def test_an_order_fills_and_opens_a_position(self):
         paper, _ = broker()
         order = await paper.place_order(intent())

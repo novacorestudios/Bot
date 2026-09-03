@@ -43,7 +43,10 @@ def _calls_in(source: str) -> set[str]:
 
 
 def build_risk(clock: VirtualClock) -> RiskEngine:
-    return RiskEngine(CONFIG, CandleStore(500), clock)
+    standard = CONFIG.model_copy(
+        update={"trade": CONFIG.trade.model_copy(update={"raw_signal_mode": False})}
+    )
+    return RiskEngine(standard, CandleStore(500), clock)
 
 
 def context(

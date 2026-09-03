@@ -83,9 +83,11 @@ class ModeLimits:
 LIMITS: dict[PreservationMode, ModeLimits] = {
     PreservationMode.NORMAL: ModeLimits(1.0, 0, 0, 0.0),
     PreservationMode.CAUTIOUS: ModeLimits(0.6, -1, 0, 0.0),
-    # One position at a time, and only for opportunities that are genuinely
-    # exceptional rather than merely acceptable.
-    PreservationMode.DEFENSIVE: ModeLimits(0.35, -2, 1, 85.0),
+    # Keep risk per trade heavily reduced, but do not choke an already
+    # edge-qualified pipeline after a short losing streak.  Two positions and
+    # a 78 score still tighten the normal limits without making recovery
+    # depend on a tiny handful of 85+ observations.
+    PreservationMode.DEFENSIVE: ModeLimits(0.35, -2, 2, 78.0),
     PreservationMode.HALTED: ModeLimits(0.0, -99, 0, 101.0),
 }
 

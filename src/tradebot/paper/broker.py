@@ -249,6 +249,13 @@ class PaperBroker:
         leverage = max(1, self.leverage.get(intent.symbol, intent.leverage))
         margin = notional / leverage
 
+        margin_cap = intent.metadata.get("margin_per_trade_cap")
+        if margin_cap is not None and margin > float(margin_cap) + 1e-12:
+            order.status = OrderStatus.REJECTED
+            order.error = "filled initial margin exceeds per-trade cap"
+            self.rejected_count += 1
+            return order
+
         if margin + fee > self.account.balance - self.account.margin_used:
             order.status = OrderStatus.REJECTED
             order.error = "insufficient simulated margin"

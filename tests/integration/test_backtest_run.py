@@ -73,7 +73,12 @@ class TestEngineMechanics:
         assert result.metrics.initial_capital == 75.0
 
     def test_capital_is_preserved_when_no_trade_is_taken(self):
-        result = BacktestEngine(BACKTEST_CONFIG, 75.0).run(dataset({"FLATUSDT": flat_prices(1000)}))
+        config = BACKTEST_CONFIG.model_copy(
+            update={
+                "trade": BACKTEST_CONFIG.trade.model_copy(update={"raw_signal_mode": False})
+            }
+        )
+        result = BacktestEngine(config, 75.0).run(dataset({"FLATUSDT": flat_prices(1000)}))
         assert result.metrics.total_trades == 0
         assert result.metrics.final_capital == pytest.approx(75.0)
         assert result.metrics.net_profit == pytest.approx(0.0)
@@ -229,8 +234,13 @@ class TestShippedDefaultsAreConservative:
 
     def test_default_consensus_requirement_is_the_binding_constraint(self):
         data = dataset({"AAAUSDT": TRENDING, "BBBUSDT": CHOPPY})
-        strict = BacktestEngine(BACKTEST_CONFIG, 75.0).run(data)
-        relaxed = BacktestEngine(permissive(BACKTEST_CONFIG), 75.0).run(data)
+        consensus_mode = BACKTEST_CONFIG.model_copy(
+            update={
+                "trade": BACKTEST_CONFIG.trade.model_copy(update={"raw_signal_mode": False})
+            }
+        )
+        strict = BacktestEngine(consensus_mode, 75.0).run(data)
+        relaxed = BacktestEngine(permissive(consensus_mode), 75.0).run(data)
         assert relaxed.metrics.total_trades >= strict.metrics.total_trades
         assert strict.rejections.get("INSUFFICIENT_CONSENSUS", 0) > 0
 

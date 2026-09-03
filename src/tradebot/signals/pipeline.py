@@ -28,7 +28,7 @@ from tradebot.core.types import (
     Signal,
 )
 from tradebot.market.microstructure import CostModel, LiquiditySnapshot
-from tradebot.signals.aggregator import SignalAggregator
+from tradebot.signals.aggregator import AggregationResult, SignalAggregator
 from tradebot.signals.edge import EdgeCalculator, EdgeDecision
 from tradebot.signals.opportunity import OpportunityInputs, OpportunityScorer
 from tradebot.strategies.base import MarketView
@@ -158,9 +158,12 @@ class SignalPipeline:
             )
 
         # -- 2. consensus ----------------------------------------------------
-        aggregation = self.aggregator.aggregate(
-            symbol, signals, weights, view.regime, timestamp, strategy_allocation
-        )
+        if self.config.trade.raw_signal_mode:
+            aggregation = self._raw_signal(symbol, signals, weights, view.regime, timestamp)
+        else:
+            aggregation = self.aggregator.aggregate(
+                symbol, signals, weights, view.regime, timestamp, strategy_allocation
+            )
         if not aggregation.accepted:
             return self._reject(
                 symbol,
@@ -215,7 +218,9 @@ class SignalPipeline:
             )
         )
 
-        if not self.opportunity_scorer.accepts(opportunity_score):
+        if not self.config.trade.raw_signal_mode and not self.opportunity_scorer.accepts(
+            opportunity_score
+        ):
             return self._reject(
                 symbol,
                 RejectionReason.LOW_OPPORTUNITY_SCORE,
@@ -230,7 +235,7 @@ class SignalPipeline:
                 consensus=signal.consensus_score,
             )
 
-        if not edge.accepted:
+        if not self.config.trade.raw_signal_mode and not edge.accepted:
             breakeven = self.edge_calculator.breakeven_win_rate(
                 edge.estimate.gross_win,
                 edge.estimate.gross_loss,
@@ -296,6 +301,75 @@ class SignalPipeline:
         )
 
     # ------------------------------------------------------------------ #
+    def _raw_signal(
+        self,
+        symbol: str,
+        signals: list[Signal],
+        weights: dict[str, float],
+        regime: MarketRegime,
+        timestamp: int,
+    ) -> AggregationResult:
+        """Return the strongest executable raw opinion for this symbol/cycle."""
+        actionable = [
+            signal
+            for signal in signals
+            if signal.direction is not Direction.WAIT
+            and signal.entry_price > 0
+            and weights.get(signal.strategy, 0.0) > 0
+        ]
+        if not actionable:
+            return AggregationResult(
+                None,
+                RejectionReason.NO_SIGNAL,
+                "no strategy produced an actionable raw signal",
+                considered=len(signals),
+                agreeing=0,
+            )
+
+        chosen = max(
+            actionable,
+            key=lambda signal: (
+                weights.get(signal.strategy, 0.0) * signal.confidence,
+                signal.strategy,
+            ),
+        )
+        cfg = self.config.trade
+        target_pct = max(
+            cfg.raw_take_profit_min_pct,
+            min(cfg.raw_take_profit_max_pct, chosen.volatility),
+        )
+        sign = 1.0 if chosen.direction is Direction.LONG else -1.0
+        stop = chosen.entry_price * (1.0 - sign * cfg.raw_stop_pct)
+        target = chosen.entry_price * (1.0 + sign * target_pct)
+        opposing = tuple(s for s in actionable if s.direction is not chosen.direction)
+        raw = AggregatedSignal(
+            symbol=symbol,
+            direction=chosen.direction,
+            consensus_score=chosen.confidence,
+            confidence=chosen.confidence,
+            entry_price=chosen.entry_price,
+            stop_loss=stop,
+            take_profit=target,
+            contributing=(chosen,),
+            opposing=opposing,
+            conflict_ratio=0.0,
+            regime=regime,
+            timestamp=timestamp,
+            reason_codes=chosen.reason_codes,
+            metadata={
+                "raw_signal_mode": True,
+                "raw_strategy": chosen.strategy,
+                "raw_target_pct": target_pct,
+                "raw_stop_pct": cfg.raw_stop_pct,
+            },
+        )
+        return AggregationResult(
+            raw,
+            considered=len(signals),
+            agreeing=1,
+            consensus=chosen.confidence,
+        )
+
     def _expected_duration(self, signal: AggregatedSignal) -> float:
         durations = [
             s.expected_duration_sec for s in signal.contributing if s.expected_duration_sec > 0

@@ -221,7 +221,7 @@ class RiskEngine:
             )
 
         # -- 3c. a defensive mode raises the bar for what is worth taking ----- #
-        if self.config.preservation.enabled:
+        if self.config.preservation.enabled and not self.config.trade.raw_signal_mode:
             required = self.preservation.min_opportunity_score(self.config.opportunity.min_score)
             if opportunity.opportunity_score.total < required:
                 return self._reject(
@@ -409,6 +409,7 @@ class RiskEngine:
                 "liquidation_price": sizing.liquidation_price,
                 "liquidation_distance_multiple": sizing.liquidation_distance_multiple,
                 "margin_required": sizing.margin_required,
+                "margin_per_trade_cap": self.config.risk.max_margin_per_trade,
                 "risk_fraction": safe_div(sizing.risk_amount, context.equity, 0.0),
                 "correlation": assessment.portfolio_correlation,
                 "effective_positions": assessment.effective_positions,

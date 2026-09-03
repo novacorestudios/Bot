@@ -102,13 +102,13 @@ class TestModeLimits:
     def test_risk_is_scaled_down_never_up(self) -> None:
         assert all(LIMITS[m].risk_multiplier <= 1.0 for m in PreservationMode)
 
-    def test_defensive_allows_one_position_and_only_exceptional_ones(
+    def test_defensive_allows_two_positions_and_only_high_quality_ones(
         self, preservation: CapitalPreservation
     ) -> None:
         preservation.evaluate(drawdown=0.07, daily_loss=0.0, consecutive_losses=0)
         assert preservation.mode is PreservationMode.DEFENSIVE
-        assert preservation.max_positions(4) == 1
-        assert preservation.min_opportunity_score(70.0) == 85.0
+        assert preservation.max_positions(4) == 2
+        assert preservation.min_opportunity_score(70.0) == 78.0
 
     def test_halted_permits_no_position_at_all(self, preservation: CapitalPreservation) -> None:
         preservation.evaluate(drawdown=0.15, daily_loss=0.0, consecutive_losses=0)

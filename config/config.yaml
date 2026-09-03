@@ -280,9 +280,14 @@ edge:
   confidence_lower_bound_z: 1.0
 
 trade:
+  # Aggressive research mode: strongest actionable raw signal per symbol/cycle.
+  raw_signal_mode: true
+  raw_stop_pct: 0.05
+  raw_take_profit_min_pct: 0.0005
+  raw_take_profit_max_pct: 0.01
   max_duration_sec: 3600        # hard 60 minute cap
   # Exit early if the remaining expected edge turns negative.
-  exit_on_negative_edge: true
+  exit_on_negative_edge: false
   exit_on_regime_change: true
   exit_on_signal_flip: true
 
