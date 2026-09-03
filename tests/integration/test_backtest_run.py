@@ -74,9 +74,7 @@ class TestEngineMechanics:
 
     def test_capital_is_preserved_when_no_trade_is_taken(self):
         config = BACKTEST_CONFIG.model_copy(
-            update={
-                "trade": BACKTEST_CONFIG.trade.model_copy(update={"raw_signal_mode": False})
-            }
+            update={"trade": BACKTEST_CONFIG.trade.model_copy(update={"raw_signal_mode": False})}
         )
         result = BacktestEngine(config, 75.0).run(dataset({"FLATUSDT": flat_prices(1000)}))
         assert result.metrics.total_trades == 0
@@ -235,9 +233,7 @@ class TestShippedDefaultsAreConservative:
     def test_default_consensus_requirement_is_the_binding_constraint(self):
         data = dataset({"AAAUSDT": TRENDING, "BBBUSDT": CHOPPY})
         consensus_mode = BACKTEST_CONFIG.model_copy(
-            update={
-                "trade": BACKTEST_CONFIG.trade.model_copy(update={"raw_signal_mode": False})
-            }
+            update={"trade": BACKTEST_CONFIG.trade.model_copy(update={"raw_signal_mode": False})}
         )
         strict = BacktestEngine(consensus_mode, 75.0).run(data)
         relaxed = BacktestEngine(permissive(consensus_mode), 75.0).run(data)

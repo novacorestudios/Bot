@@ -290,7 +290,9 @@ class ExecutionEngine:
                 ExitReason.RISK_EVENT,
                 "filled initial margin exceeded the per-trade cap",
             )
-            return ExecutionResult.failure("filled initial margin exceeded the per-trade cap", order)
+            return ExecutionResult.failure(
+                "filled initial margin exceeded the per-trade cap", order
+            )
 
         position = Position(
             position_id=new_id("p_"),

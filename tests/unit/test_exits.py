@@ -214,8 +214,11 @@ class TestSignalFlip:
 
 
 class TestNegativeEdge:
-    def test_a_negative_holding_edge_closes_the_position(self, evaluator: ExitEvaluator) -> None:
-        decision = evaluator.evaluate(make_position(), ctx(holding_edge=-0.0004))
+    def test_a_negative_holding_edge_closes_the_position(self) -> None:
+        config = CONFIG.model_copy(
+            update={"trade": CONFIG.trade.model_copy(update={"exit_on_negative_edge": True})}
+        )
+        decision = ExitEvaluator(config).evaluate(make_position(), ctx(holding_edge=-0.0004))
         assert decision.reason is ExitReason.NEGATIVE_EDGE
 
     def test_a_positive_edge_holds(self, evaluator: ExitEvaluator) -> None:
